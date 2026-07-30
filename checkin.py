@@ -36,6 +36,24 @@ def normalize_secret(secret: str) -> str:
     return cleaned
 
 
+def mask_username(username: str) -> str:
+    if not username:
+        return username
+    username = str(username)
+    if "@" in username:
+        local, _, domain = username.partition("@")
+        if len(local) <= 2:
+            masked_local = local[0] + "*" * max(1, len(local) - 1)
+        else:
+            masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
+        return f"{masked_local}@{domain}"
+    if len(username) <= 2:
+        return username[0] + "*"
+    if len(username) <= 4:
+        return username[0] + "*" * (len(username) - 1)
+    return username[:2] + "*" * (len(username) - 4) + username[-2:]
+
+
 def generate_totp_code(secret: str, digits: int = 6, period: int = 30):
     secret = (secret or OTP_SECRET or "").strip()
     if not secret:
@@ -283,9 +301,10 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
         f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}",
     ]
 
+    last_error = None
+    print("🔐 检测到 2FA，正在自动提交验证码...")
     for endpoint in otp_endpoints:
         for index, candidate in enumerate(otp_payload_candidates, 1):
-            print(f"🔐 尝试 OTP 提交: endpoint={endpoint} payload={list(candidate.keys())}")
             body = {**payload, **candidate} if endpoint.endswith("login?turnstile=" + quote(TURNSTILE_TOKEN)) else candidate
             otp_resp = session.post(
                 endpoint,
@@ -300,8 +319,7 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
 
             if otp_data.get("success") is True:
                 if isinstance(otp_data.get("data"), dict) and otp_data["data"].get("require_2fa"):
-                    print("服务端仍要求继续提供验证码，继续尝试下一种提交方式")
-                    print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:2000])
+                    last_error = f"{endpoint} payload={list(candidate.keys())} message=继续要求 2FA"
                     continue
                 extracted = _extract_user_info(otp_data)
                 if extracted and extracted.get("id") not in (None, ""):
@@ -312,13 +330,16 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
                 return None
 
             if otp_resp.status_code == 200 and otp_data.get("message"):
-                print("2FA 提交响应:", otp_data.get("message"))
+                last_error = f"{endpoint} payload={list(candidate.keys())} message={otp_data.get('message')}"
 
-    print("2FA 验证失败，登录流程未完成")
+    if last_error:
+        print("2FA 提交失败，最后一次响应：", last_error)
+    else:
+        print("2FA 验证失败，登录流程未完成")
     return None
 
 
-def login(session: requests.Session, email, password, otp_secret=""):
+def login(session: requests.Session, email, password, otp_secret="", use_proxy=False):
     """登录并返回用户信息（id + username），若触发 2FA 则自动提交验证码。"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
 
@@ -331,10 +352,13 @@ def login(session: requests.Session, email, password, otp_secret=""):
     }
 
     payload = {"username": email, "password": password}
-    max_attempts = 3
+    max_attempts = 1 if use_proxy else 3
     for attempt in range(1, max_attempts + 1):
         resp = session.post(login_url, headers=headers, json=payload, timeout=20)
         if resp.status_code != 429:
+            break
+        if use_proxy:
+            print("代理登录限流，立即切换直连")
             break
         wait_seconds = attempt * 2
         print(f"登录请求被限流 (429)，第 {attempt}/{max_attempts} 次重试，等待 {wait_seconds}s...")
@@ -461,14 +485,26 @@ def run_account(account, account_index, total_accounts):
         proxy_ready = proxy_process is not None
         session = build_session(account, proxy_ready=proxy_ready)
 
-        user, status = login(session, email, password, account.get("otp_secret") or os.environ.get("OTP_SECRET", ""))
+        user, status = login(
+            session,
+            email,
+            password,
+            account.get("otp_secret") or os.environ.get("OTP_SECRET", ""),
+            use_proxy=proxy_ready,
+        )
         if status == 429 and proxy_ready:
             print("检测到代理导致登录限流，尝试关代理直连")
             stop_local_proxy(proxy_process, temp_dir)
             proxy_process = None
             proxy_ready = False
             session = build_session(account, proxy_ready=proxy_ready)
-            user, status = login(session, email, password, account.get("otp_secret") or os.environ.get("OTP_SECRET", ""))
+            user, status = login(
+                session,
+                email,
+                password,
+                account.get("otp_secret") or os.environ.get("OTP_SECRET", ""),
+                use_proxy=False,
+            )
 
         if not user:
             print("\n登录失败，无法继续签到")
@@ -476,6 +512,7 @@ def run_account(account, account_index, total_accounts):
 
         user_id = user["id"]
         username = user.get("username", str(user_id))
+        masked_username = mask_username(username)
 
         info_before = get_user_info(session, user_id)
         if not info_before:
@@ -499,31 +536,31 @@ def run_account(account, account_index, total_accounts):
             awarded_data = checkin_data.get("data", {})
             awarded_quota = awarded_data.get("quota_awarded", 0)
             awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
-            log_summary = f"✅ 签到成功 | 账户: {username}"
+            log_summary = f"✅ 签到成功 | 账户: {masked_username}"
             message = (
                 f"🎁 iamhc 签到通知\n\n"
                 f"✅ 签到成功,本次签到获得{awarded_dollar}$\n"
-                f"👤 登录账户: {username}\n"
+                f"👤 登录账户: {masked_username}\n"
                 f"💰 昨日余额: {balance_before}$\n"
                 f"💰 当前余额: {balance_after}$\n"
                 f"⏱️ 签到时间: {now}"
             )
         elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
-            log_summary = f"✅ 今日已签到 | 账户: {username}"
+            log_summary = f"✅ 今日已签到 | 账户: {masked_username}"
             message = (
                 f"🎁 iamhc 签到通知\n\n"
                 f"✅ 今日你已经签到过了！\n"
-                f"👤 登录账户: {username}\n"
+                f"👤 登录账户: {masked_username}\n"
                 f"💰 昨日余额: {balance_before}$\n"
                 f"💰 当前余额: {balance_after}$\n"
                 f"⏱️ 签到时间: {now}"
             )
         else:
-            log_summary = f"❌ 签到失败 | 账户: {username} | {msg}"
+            log_summary = f"❌ 签到失败 | 账户: {masked_username} | {msg}"
             message = (
                 f"🎁 iamhc 签到通知\n\n"
                 f"❌ 签到失败: {msg}\n"
-                f"👤 登录账户: {username}\n"
+                f"👤 登录账户: {masked_username}\n"
                 f"💰 昨日余额: {balance_before}$\n"
                 f"💰 当前余额: {balance_after}$\n"
                 f"⏱️ 签到时间: {now}"
