@@ -192,6 +192,40 @@ def stop_local_proxy(process, temp_dir):
             pass
 
 
+def _extract_user_info(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    candidates = []
+    if isinstance(payload.get("data"), dict):
+        candidates.append(payload["data"])
+    candidates.append(payload)
+
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+
+        user_id = None
+        for key in ["id", "user_id", "userId", "uid", "uuid"]:
+            if item.get(key) not in (None, ""):
+                user_id = item.get(key)
+                break
+
+        username = None
+        for key in ["username", "name", "user_name", "email", "user_email"]:
+            if item.get(key) not in (None, ""):
+                username = item.get(key)
+                break
+
+        if user_id is not None:
+            return {"id": user_id, "username": str(username or user_id)}
+
+    if payload.get("success") is True and payload.get("message"):
+        return {"id": None, "username": payload.get("message", "")}
+
+    return None
+
+
 def login(session: requests.Session, email, password, otp_secret=""):
     """登录并返回用户信息（id + username），若触发 2FA 则自动提交验证码。"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
@@ -216,15 +250,14 @@ def login(session: requests.Session, email, password, otp_secret=""):
     except ValueError:
         data = {}
 
-    if data.get("success"):
-        user_data = data.get("data", {})
-        user_id = user_data.get("id")
-        username = user_data.get("username", "")
-        if not user_id:
-            print("登录成功但未获取到用户 ID")
-            return None
-        print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
-        return {"id": user_id, "username": username}
+    if data.get("success") is True:
+        extracted = _extract_user_info(data)
+        if extracted and extracted.get("id") not in (None, ""):
+            print(f"✅ 登录成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
+            return extracted
+        print("登录成功但未能解析到用户信息，响应体如下:")
+        print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
+        return None
 
     if not otp_secret:
         print("登录失败:", data.get("message", ""))
@@ -271,13 +304,14 @@ def login(session: requests.Session, email, password, otp_secret=""):
             otp_data = otp_resp.json()
         except ValueError:
             otp_data = {}
-        if otp_data.get("success"):
-            user_data = otp_data.get("data", {})
-            user_id = user_data.get("id")
-            username = user_data.get("username", "")
-            if user_id:
-                print(f"✅ 2FA 验证成功 | 账户: {username} | ID: {user_id}")
-                return {"id": user_id, "username": username}
+        if otp_data.get("success") is True:
+            extracted = _extract_user_info(otp_data)
+            if extracted and extracted.get("id") not in (None, ""):
+                print(f"✅ 2FA 验证成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
+                return extracted
+            print("2FA 认证成功但未能解析到用户信息，响应体如下:")
+            print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:4000])
+            return None
         if otp_resp.status_code == 200 and otp_data.get("message"):
             print("2FA 提交响应:", otp_data.get("message"))
 
