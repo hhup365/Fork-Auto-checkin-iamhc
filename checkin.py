@@ -226,54 +226,12 @@ def _extract_user_info(payload):
     return None
 
 
-def login(session: requests.Session, email, password, otp_secret=""):
-    """登录并返回用户信息（id + username），若触发 2FA 则自动提交验证码。"""
-    login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
-
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/login",
-    }
-
-    payload = {"username": email, "password": password}
-    resp = session.post(login_url, headers=headers, json=payload, timeout=20)
-
-    if resp.status_code != 200:
-        print("登录请求失败:", resp.status_code)
-        return None
-
-    try:
-        data = resp.json()
-    except ValueError:
-        data = {}
-
-    if data.get("success") is True:
-        extracted = _extract_user_info(data)
-        if extracted and extracted.get("id") not in (None, ""):
-            print(f"✅ 登录成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
-            return extracted
-        print("登录成功但未能解析到用户信息，响应体如下:")
-        print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
-        return None
-
-    if not otp_secret:
-        print("登录失败:", data.get("message", ""))
-        return None
-
-    message = str(data.get("message") or "")
-    if "2fa" not in message.lower() and "otp" not in message.lower() and "验证码" not in message:
-        print("登录失败:", data.get("message", ""))
-        return None
-
+def _submit_otp_code(session: requests.Session, email, password, otp_secret, payload):
     code = generate_totp_code(otp_secret)
     if not code:
         print("未能生成 2FA 验证码，请检查 OTP_SECRET")
         return None
 
-    print("🔐 检测到 2FA，正在自动提交验证码...")
     otp_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -317,6 +275,60 @@ def login(session: requests.Session, email, password, otp_secret=""):
 
     print("2FA 验证失败，登录流程未完成")
     return None
+
+
+def login(session: requests.Session, email, password, otp_secret=""):
+    """登录并返回用户信息（id + username），若触发 2FA 则自动提交验证码。"""
+    login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
+
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/login",
+    }
+
+    payload = {"username": email, "password": password}
+    resp = session.post(login_url, headers=headers, json=payload, timeout=20)
+
+    if resp.status_code != 200:
+        print("登录请求失败:", resp.status_code)
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+
+    if data.get("success") is True:
+        if isinstance(data.get("data"), dict) and data["data"].get("require_2fa"):
+            message = str(data.get("message") or "")
+            if not otp_secret:
+                print("登录需要 2FA，但未提供 OTP_SECRET")
+                return None
+            print("🔐 检测到 2FA，正在自动提交验证码...")
+            return _submit_otp_code(session, email, password, otp_secret, payload)
+
+        extracted = _extract_user_info(data)
+        if extracted and extracted.get("id") not in (None, ""):
+            print(f"✅ 登录成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
+            return extracted
+        print("登录成功但未能解析到用户信息，响应体如下:")
+        print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
+        return None
+
+    if not otp_secret:
+        print("登录失败:", data.get("message", ""))
+        return None
+
+    message = str(data.get("message") or "")
+    if "2fa" not in message.lower() and "otp" not in message.lower() and "验证码" not in message:
+        print("登录失败:", data.get("message", ""))
+        return None
+
+    print("🔐 检测到 2FA，正在自动提交验证码...")
+    return _submit_otp_code(session, email, password, otp_secret, payload)
 
 
 def get_user_info(session: requests.Session, user_id):
