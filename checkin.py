@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import base64
+import hashlib
+import hmac
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
-import hmac
-import hashlib
 from urllib.parse import quote
 
 import requests
@@ -26,13 +27,30 @@ LOCAL_PROXY_URL = os.environ.get("LOCAL_PROXY_URL", "http://127.0.0.1:8080").str
 OTP_SECRET = os.environ.get("OTP_SECRET", "").strip()
 
 
+def normalize_secret(secret: str) -> str:
+    if not secret:
+        return ""
+    cleaned = re.sub(r"[\s\-_=]+", "", str(secret).strip()).upper()
+    if not cleaned:
+        return ""
+    return cleaned
+
+
 def generate_totp_code(secret: str, digits: int = 6, period: int = 30):
     secret = (secret or OTP_SECRET or "").strip()
     if not secret:
         return ""
-    try:
-        secret_bytes = base64.b32decode(secret.upper() + "=" * ((8 - len(secret) % 8) % 8))
-    except Exception:
+
+    normalized_secret = normalize_secret(secret)
+    if normalized_secret:
+        try:
+            secret_bytes = base64.b32decode(normalized_secret + "=" * ((8 - len(normalized_secret) % 8) % 8))
+        except Exception:
+            try:
+                secret_bytes = bytes.fromhex(normalized_secret)
+            except ValueError:
+                secret_bytes = normalized_secret.encode("utf-8")
+    else:
         secret_bytes = secret.encode("utf-8")
 
     timestamp = int(time.time()) // period
@@ -255,11 +273,24 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
         {"username": email, "password": password, "otp": code},
         {"username": email, "password": password, "code": code},
         {"username": email, "password": password, "totp": code},
-        {"username": email, "password": password, "token": code},
+        {"username": email, "password": password, "totp_code": code},
+        {"username": email, "password": password, "otp_code": code},
+        {"username": email, "password": password, "auth_code": code},
+        {"username": email, "password": password, "two_factor_code": code},
+        {"email": email, "password": password, "otp": code},
+        {"email": email, "password": password, "code": code},
+        {"email": email, "password": password, "totp": code},
+        {"email": email, "password": password, "totp_code": code},
+        {"email": email, "password": password, "otp_code": code},
+        {"email": email, "password": password, "auth_code": code},
+        {"email": email, "password": password, "two_factor_code": code},
         {"otp": code},
         {"code": code},
         {"totp": code},
-        {"token": code},
+        {"totp_code": code},
+        {"otp_code": code},
+        {"auth_code": code},
+        {"two_factor_code": code},
     ]
 
     for candidate in otp_payload_candidates:
@@ -274,6 +305,10 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
         except ValueError:
             otp_data = {}
         if otp_data.get("success") is True:
+            if isinstance(otp_data.get("data"), dict) and otp_data["data"].get("require_2fa"):
+                print("2FA 提交后服务端仍要求继续提供验证码，继续尝试其他字段格式...")
+                print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:4000])
+                continue
             extracted = _extract_user_info(otp_data)
             if extracted and extracted.get("id") not in (None, ""):
                 print(f"✅ 2FA 验证成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
