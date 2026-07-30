@@ -272,52 +272,47 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
     otp_payload_candidates = [
         {"username": email, "password": password, "otp": code},
         {"username": email, "password": password, "code": code},
-        {"username": email, "password": password, "totp": code},
-        {"username": email, "password": password, "totp_code": code},
-        {"username": email, "password": password, "otp_code": code},
-        {"username": email, "password": password, "auth_code": code},
-        {"username": email, "password": password, "two_factor_code": code},
-        {"email": email, "password": password, "otp": code},
-        {"email": email, "password": password, "code": code},
-        {"email": email, "password": password, "totp": code},
-        {"email": email, "password": password, "totp_code": code},
-        {"email": email, "password": password, "otp_code": code},
-        {"email": email, "password": password, "auth_code": code},
-        {"email": email, "password": password, "two_factor_code": code},
         {"otp": code},
         {"code": code},
-        {"totp": code},
-        {"totp_code": code},
-        {"otp_code": code},
-        {"auth_code": code},
-        {"two_factor_code": code},
     ]
 
-    for candidate in otp_payload_candidates:
-        otp_resp = session.post(
-            f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}",
-            headers=otp_headers,
-            json={**payload, **candidate},
-            timeout=20,
-        )
-        try:
-            otp_data = otp_resp.json()
-        except ValueError:
-            otp_data = {}
-        if otp_data.get("success") is True:
-            if isinstance(otp_data.get("data"), dict) and otp_data["data"].get("require_2fa"):
-                print("2FA 提交后服务端仍要求继续提供验证码，继续尝试其他字段格式...")
-                print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:4000])
-                continue
-            extracted = _extract_user_info(otp_data)
-            if extracted and extracted.get("id") not in (None, ""):
-                print(f"✅ 2FA 验证成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
-                return extracted
-            print("2FA 认证成功但未能解析到用户信息，响应体如下:")
-            print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:4000])
-            return None
-        if otp_resp.status_code == 200 and otp_data.get("message"):
-            print("2FA 提交响应:", otp_data.get("message"))
+    otp_endpoints = [
+        f"{BASE_URL}/api/user/login/2fa",
+        f"{BASE_URL}/api/user/otp",
+        f"{BASE_URL}/otp",
+        f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}",
+    ]
+
+    for endpoint in otp_endpoints:
+        for index, candidate in enumerate(otp_payload_candidates, 1):
+            print(f"🔐 尝试 OTP 提交: endpoint={endpoint} payload={list(candidate.keys())}")
+            body = {**payload, **candidate} if endpoint.endswith("login?turnstile=" + quote(TURNSTILE_TOKEN)) else candidate
+            otp_resp = session.post(
+                endpoint,
+                headers=otp_headers,
+                json=body,
+                timeout=20,
+            )
+            try:
+                otp_data = otp_resp.json()
+            except ValueError:
+                otp_data = {}
+
+            if otp_data.get("success") is True:
+                if isinstance(otp_data.get("data"), dict) and otp_data["data"].get("require_2fa"):
+                    print("服务端仍要求继续提供验证码，继续尝试下一种提交方式")
+                    print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:2000])
+                    continue
+                extracted = _extract_user_info(otp_data)
+                if extracted and extracted.get("id") not in (None, ""):
+                    print(f"✅ 2FA 验证成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
+                    return extracted
+                print("2FA 认证成功但未能解析到用户信息，响应体如下:")
+                print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:2000])
+                return None
+
+            if otp_resp.status_code == 200 and otp_data.get("message"):
+                print("2FA 提交响应:", otp_data.get("message"))
 
     print("2FA 验证失败，登录流程未完成")
     return None
