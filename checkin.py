@@ -120,6 +120,16 @@ def build_session(account, proxy_ready=False):
     return session
 
 
+def resolve_singbox_path(path):
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return path
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(repo_root, path))
+
+
 def start_local_proxy(account, account_index, total_accounts):
     if not account.get("proxy_url"):
         return None, None
@@ -150,6 +160,7 @@ def start_local_proxy(account, account_index, total_accounts):
         return None, temp_dir
 
     singbox_bin = os.environ.get("SINGBOX_BIN") or shutil.which("sing-box") or os.path.join(repo_root, "sing-box")
+    singbox_bin = resolve_singbox_path(singbox_bin)
     if not singbox_bin or not os.path.exists(singbox_bin):
         print("未找到 sing-box 可执行文件，请确保工作流已下载内核或设置 SINGBOX_BIN")
         return None, temp_dir
