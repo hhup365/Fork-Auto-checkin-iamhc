@@ -49,9 +49,7 @@ def mask_username(username: str) -> str:
         return f"{masked_local}@{domain}"
     if len(username) <= 2:
         return username[0] + "*"
-    if len(username) <= 4:
-        return username[0] + "*" * (len(username) - 1)
-    return username[:2] + "*" * (len(username) - 4) + username[-2:]
+    return username[0] + "*" * (len(username) - 2) + username[-1]
 
 
 def generate_totp_code(secret: str, digits: int = 6, period: int = 30):
@@ -302,7 +300,6 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
     ]
 
     last_error = None
-    print("🔐 检测到 2FA，正在自动提交验证码...")
     for endpoint in otp_endpoints:
         for index, candidate in enumerate(otp_payload_candidates, 1):
             body = {**payload, **candidate} if endpoint.endswith("login?turnstile=" + quote(TURNSTILE_TOKEN)) else candidate
