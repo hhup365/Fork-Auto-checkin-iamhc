@@ -467,6 +467,28 @@ def send_notification(message, log_summary=None):
         print("未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过 Telegram 推送")
 
 
+def build_summary_message(results):
+    if not results:
+        return ""
+
+    summary_lines = []
+    for index, result in enumerate(results, 1):
+        if result["status"] == "success":
+            summary_lines.append(
+                f"{index}. {result['masked_username']}：签到成功，获得 {result['awarded']}$，余额 {result['balance_after']}$"
+            )
+        elif result["status"] == "checked":
+            summary_lines.append(
+                f"{index}. {result['masked_username']}：今日已签到，余额 {result['balance_after']}$"
+            )
+        else:
+            summary_lines.append(
+                f"{index}. {result['masked_username']}：签到失败，{result['detail']}"
+            )
+
+    return "🎁 iamhc 签到汇总\n\n" + "\n".join(summary_lines)
+
+
 def run_account(account, account_index, total_accounts):
     email = account.get("email", "")
     password = account.get("password", "")
@@ -534,36 +556,43 @@ def run_account(account, account_index, total_accounts):
             awarded_quota = awarded_data.get("quota_awarded", 0)
             awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
             log_summary = f"✅ 签到成功 | 账户: {masked_username}"
-            message = (
-                f"🎁 iamhc 签到通知\n\n"
-                f"✅ 签到成功,本次签到获得{awarded_dollar}$\n"
-                f"👤 登录账户: {masked_username}\n"
-                f"💰 昨日余额: {balance_before}$\n"
-                f"💰 当前余额: {balance_after}$\n"
-                f"⏱️ 签到时间: {now}"
-            )
+            print("\n" + "=" * 25)
+            print(log_summary)
+            print("=" * 25)
+            return {
+                "masked_username": masked_username,
+                "status": "success",
+                "detail": msg,
+                "balance_before": balance_before,
+                "balance_after": balance_after,
+                "awarded": awarded_dollar,
+            }
         elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
             log_summary = f"✅ 今日已签到 | 账户: {masked_username}"
-            message = (
-                f"🎁 iamhc 签到通知\n\n"
-                f"✅ 今日你已经签到过了！\n"
-                f"👤 登录账户: {masked_username}\n"
-                f"💰 昨日余额: {balance_before}$\n"
-                f"💰 当前余额: {balance_after}$\n"
-                f"⏱️ 签到时间: {now}"
-            )
+            print("\n" + "=" * 25)
+            print(log_summary)
+            print("=" * 25)
+            return {
+                "masked_username": masked_username,
+                "status": "checked",
+                "detail": msg,
+                "balance_before": balance_before,
+                "balance_after": balance_after,
+                "awarded": 0,
+            }
         else:
             log_summary = f"❌ 签到失败 | 账户: {masked_username} | {msg}"
-            message = (
-                f"🎁 iamhc 签到通知\n\n"
-                f"❌ 签到失败: {msg}\n"
-                f"👤 登录账户: {masked_username}\n"
-                f"💰 昨日余额: {balance_before}$\n"
-                f"💰 当前余额: {balance_after}$\n"
-                f"⏱️ 签到时间: {now}"
-            )
-
-        send_notification(message, log_summary=log_summary)
+            print("\n" + "=" * 25)
+            print(log_summary)
+            print("=" * 25)
+            return {
+                "masked_username": masked_username,
+                "status": "failed",
+                "detail": msg,
+                "balance_before": balance_before,
+                "balance_after": balance_after,
+                "awarded": 0,
+            }
     finally:
         if proxy_process is not None:
             stop_local_proxy(proxy_process, temp_dir)
@@ -576,9 +605,16 @@ def main():
         sys.exit(1)
 
     print(f"共发现 {len(accounts)} 个账号配置")
+    results = []
     for index, account in enumerate(accounts, 1):
         print(f"\n===== 账号 {index}/{len(accounts)} =====")
-        run_account(account, index, len(accounts))
+        result = run_account(account, index, len(accounts))
+        if result:
+            results.append(result)
+
+    summary_message = build_summary_message(results)
+    if summary_message:
+        send_notification(summary_message, log_summary=f"✅ 签到汇总 | {len(results)} 账号")
 
 
 if __name__ == "__main__":
