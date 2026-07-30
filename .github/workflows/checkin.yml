@@ -4,7 +4,7 @@ on:
   schedule:
     # 每天 UTC 23:00 运行（即北京时间次日 07:00）
     - cron: '0 23 * * *'
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch:
 
 jobs:
   checkin:
@@ -25,12 +25,97 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run checkin
+      - name: Download sing-box
+        run: |
+          mkdir -p .tools
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import shutil
+          from pathlib import Path
+
+          api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+          with urllib.request.urlopen(api_url, timeout=30) as response:
+              data = json.load(response)
+
+          asset_url = None
+          for asset in data.get("assets", []):
+              name = asset.get("name", "")
+              if "linux-amd64" in name and name.endswith(".tar.gz"):
+                  asset_url = asset["browser_download_url"]
+                  break
+
+          if not asset_url:
+              raise SystemExit("Unable to find sing-box linux-amd64 asset")
+
+          archive_path = Path(".tools/sing-box.tar.gz")
+          urllib.request.urlretrieve(asset_url, archive_path)
+          shutil.unpack_archive(archive_path, ".tools")
+          binary_path = Path(".tools/sing-box")
+          if not binary_path.exists():
+              for candidate in Path(".tools").glob("**/sing-box"):
+                  if candidate.is_file():
+                      binary_path = candidate
+                      break
+          binary_path.chmod(0o755)
+          print(f"Downloaded sing-box to {binary_path}")
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fh:
+              fh.write(str(binary_path.parent) + "\n")
+          PY
+
+      - name: Prepare account config
         env:
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
+          EMAIL_1: ${{ secrets.EMAIL_1 }}
+          PASSWORD_1: ${{ secrets.PASSWORD_1 }}
+          PROXY_URL_1: ${{ secrets.PROXY_URL_1 }}
+          EMAIL_2: ${{ secrets.EMAIL_2 }}
+          PASSWORD_2: ${{ secrets.PASSWORD_2 }}
+          PROXY_URL_2: ${{ secrets.PROXY_URL_2 }}
+          EMAIL_3: ${{ secrets.EMAIL_3 }}
+          PASSWORD_3: ${{ secrets.PASSWORD_3 }}
+          PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          accounts = []
+          for index in range(1, 4):
+              email = os.getenv(f"EMAIL_{index}", "").strip()
+              password = os.getenv(f"PASSWORD_{index}", "").strip()
+              proxy_url = os.getenv(f"PROXY_URL_{index}", "").strip()
+              if email or password or proxy_url:
+                  accounts.append({"email": email, "password": password, "proxy_url": proxy_url})
+
+          if not accounts:
+              accounts.append(
+                  {
+                      "email": os.getenv("EMAIL", "").strip(),
+                      "password": os.getenv("PASSWORD", "").strip(),
+                      "proxy_url": os.getenv("PROXY_URL", "").strip(),
+                  }
+              )
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"ACCOUNTS_JSON={json.dumps(accounts, ensure_ascii=False)}\n")
+              fh.write("LOCAL_PROXY_URL=http://127.0.0.1:8080\n")
+              fh.write(f"SINGBOX_BIN={Path('.tools/sing-box').resolve()}\n")
+              fh.write(f"TG_BOT_TOKEN={os.getenv('TG_BOT_TOKEN', '')}\n")
+              fh.write(f"TG_CHAT_ID={os.getenv('TG_CHAT_ID', '')}\n")
+          print(json.dumps(accounts, ensure_ascii=False))
+          PY
+
+      - name: Run checkin
+        env:
+          ACCOUNTS_JSON: ${{ env.ACCOUNTS_JSON }}
+          LOCAL_PROXY_URL: ${{ env.LOCAL_PROXY_URL }}
+          SINGBOX_BIN: ${{ env.SINGBOX_BIN }}
+          TG_BOT_TOKEN: ${{ env.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ env.TG_CHAT_ID }}
         run: python checkin.py
 
       - name: clear old run jobs
