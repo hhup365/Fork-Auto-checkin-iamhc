@@ -107,15 +107,16 @@ def load_accounts_from_env():
     return []
 
 
-def build_session(account):
+def build_session(account, proxy_ready=False):
     session = requests.Session()
     session.trust_env = False
-    proxy_address = LOCAL_PROXY_URL if account.get("proxy_url") else None
-    if proxy_address:
+    if proxy_ready and account.get("proxy_url"):
+        proxy_address = LOCAL_PROXY_URL
         session.proxies = {"http": proxy_address, "https": proxy_address, "all": proxy_address}
         print(f"🔀 代理已启用 | {proxy_address}")
     else:
-        print("🔓 未配置代理，将直接连接")
+        session.proxies = {}
+        print("🔓 代理未就绪，将直接连接")
     return session
 
 
@@ -356,9 +357,11 @@ def run_account(account, account_index, total_accounts):
 
     proxy_process = None
     temp_dir = None
+    proxy_ready = False
     try:
         proxy_process, temp_dir = start_local_proxy(account, account_index, total_accounts)
-        session = build_session(account)
+        proxy_ready = proxy_process is not None
+        session = build_session(account, proxy_ready=proxy_ready)
 
         user = login(session, email, password, account.get("otp_secret") or os.environ.get("OTP_SECRET", ""))
         if not user:
