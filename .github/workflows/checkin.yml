@@ -3,7 +3,7 @@ name: iamhc Daily Checkin
 on:
   schedule:
     # 每天 UTC 23:00 运行（即北京时间次日 07:00）
-    - cron: '0 23 * * *'
+    - cron: '11 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -11,11 +11,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -142,6 +144,15 @@ jobs:
           echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > time.txt
           chmod 755 time.txt
           ls -l time.txt
+
+      - name: Commit updated time.txt
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add time.txt
+          git diff --cached --quiet || git commit -m "Update last checkin time"
+          git push
 
       - name: clear old run jobs
         if: always()
