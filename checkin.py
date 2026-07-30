@@ -331,11 +331,22 @@ def login(session: requests.Session, email, password, otp_secret=""):
     }
 
     payload = {"username": email, "password": password}
-    resp = session.post(login_url, headers=headers, json=payload, timeout=20)
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        resp = session.post(login_url, headers=headers, json=payload, timeout=20)
+        if resp.status_code != 429:
+            break
+        wait_seconds = attempt * 2
+        print(f"登录请求被限流 (429)，第 {attempt}/{max_attempts} 次重试，等待 {wait_seconds}s...")
+        time.sleep(wait_seconds)
+
+    if resp.status_code == 429:
+        print("登录请求仍然被限流，建议切换直连或降低请求频率")
+        return None, 429
 
     if resp.status_code != 200:
         print("登录请求失败:", resp.status_code)
-        return None
+        return None, resp.status_code
 
     try:
         data = resp.json()
@@ -347,29 +358,29 @@ def login(session: requests.Session, email, password, otp_secret=""):
             message = str(data.get("message") or "")
             if not otp_secret:
                 print("登录需要 2FA，但未提供 OTP_SECRET")
-                return None
+                return None, 200
             print("🔐 检测到 2FA，正在自动提交验证码...")
-            return _submit_otp_code(session, email, password, otp_secret, payload)
+            return _submit_otp_code(session, email, password, otp_secret, payload), 200
 
         extracted = _extract_user_info(data)
         if extracted and extracted.get("id") not in (None, ""):
             print(f"✅ 登录成功 | 账户: {extracted['username']} | ID: {extracted['id']}")
-            return extracted
+            return extracted, 200
         print("登录成功但未能解析到用户信息，响应体如下:")
         print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
-        return None
+        return None, 200
 
     if not otp_secret:
         print("登录失败:", data.get("message", ""))
-        return None
+        return None, 200
 
     message = str(data.get("message") or "")
     if "2fa" not in message.lower() and "otp" not in message.lower() and "验证码" not in message:
         print("登录失败:", data.get("message", ""))
-        return None
+        return None, 200
 
     print("🔐 检测到 2FA，正在自动提交验证码...")
-    return _submit_otp_code(session, email, password, otp_secret, payload)
+    return _submit_otp_code(session, email, password, otp_secret, payload), 200
 
 
 def get_user_info(session: requests.Session, user_id):
@@ -450,7 +461,15 @@ def run_account(account, account_index, total_accounts):
         proxy_ready = proxy_process is not None
         session = build_session(account, proxy_ready=proxy_ready)
 
-        user = login(session, email, password, account.get("otp_secret") or os.environ.get("OTP_SECRET", ""))
+        user, status = login(session, email, password, account.get("otp_secret") or os.environ.get("OTP_SECRET", ""))
+        if status == 429 and proxy_ready:
+            print("检测到代理导致登录限流，尝试关代理直连")
+            stop_local_proxy(proxy_process, temp_dir)
+            proxy_process = None
+            proxy_ready = False
+            session = build_session(account, proxy_ready=proxy_ready)
+            user, status = login(session, email, password, account.get("otp_secret") or os.environ.get("OTP_SECRET", ""))
+
         if not user:
             print("\n登录失败，无法继续签到")
             return
