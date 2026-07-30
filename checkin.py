@@ -320,7 +320,7 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
                     continue
                 extracted = _extract_user_info(otp_data)
                 if extracted and extracted.get("id") not in (None, ""):
-                    print(f"✅ 2FA 验证成功 | 账户: {extracted['username']}")
+                    print(f"✅ 2FA 验证成功 | 账户: {mask_username(extracted['username'])}")
                     return extracted
                 print("2FA 认证成功但未能解析到用户信息，响应体如下:")
                 print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:2000])
@@ -385,7 +385,7 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
 
         extracted = _extract_user_info(data)
         if extracted and extracted.get("id") not in (None, ""):
-            print(f"✅ 登录成功 | 账户: {extracted['username']}")
+            print(f"✅ 登录成功 | 账户: {mask_username(extracted['username'])}")
             return extracted, 200
         print("登录成功但未能解析到用户信息，响应体如下:")
         print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
