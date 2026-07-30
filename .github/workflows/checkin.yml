@@ -31,8 +31,9 @@ jobs:
           python - <<'PY'
           import json
           import os
-          import urllib.request
           import shutil
+          import subprocess
+          import urllib.request
           from pathlib import Path
 
           api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
@@ -51,17 +52,22 @@ jobs:
 
           archive_path = Path(".tools/sing-box.tar.gz")
           urllib.request.urlretrieve(asset_url, archive_path)
-          shutil.unpack_archive(archive_path, ".tools")
-          binary_path = Path(".tools/sing-box")
-          if not binary_path.exists():
-              for candidate in Path(".tools").glob("**/sing-box"):
-                  if candidate.is_file():
-                      binary_path = candidate
-                      break
+          subprocess.run(["tar", "-xzf", str(archive_path), "-C", ".tools"], check=True)
+
+          binary_path = None
+          for candidate in Path(".tools").rglob("sing-box"):
+              if candidate.is_file():
+                  binary_path = candidate
+                  break
+          if binary_path is None:
+              raise SystemExit("Unable to locate sing-box binary after extraction")
+
           binary_path.chmod(0o755)
           print(f"Downloaded sing-box to {binary_path}")
           with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fh:
               fh.write(str(binary_path.parent) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"SINGBOX_BIN={binary_path}\n")
           PY
 
       - name: Prepare account config
@@ -117,6 +123,13 @@ jobs:
           TG_BOT_TOKEN: ${{ env.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ env.TG_CHAT_ID }}
         run: python checkin.py
+
+      - name: Write time marker
+        if: always()
+        run: |
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > time.txt
+          chmod 755 time.txt
+          ls -l time.txt
 
       - name: clear old run jobs
         if: always()
