@@ -28,49 +28,30 @@ jobs:
         run: pip install requests
 
       - name: Download sing-box
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mkdir -p .tools
-          python - <<'PY'
-          import json
-          import os
-          import shutil
-          import subprocess
-          import urllib.request
-          from pathlib import Path
-
-          api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-          with urllib.request.urlopen(api_url, timeout=30) as response:
-              data = json.load(response)
-
-          asset_url = None
-          for asset in data.get("assets", []):
-              name = asset.get("name", "")
-              if "linux-amd64" in name and name.endswith(".tar.gz"):
-                  asset_url = asset["browser_download_url"]
-                  break
-
-          if not asset_url:
-              raise SystemExit("Unable to find sing-box linux-amd64 asset")
-
-          archive_path = Path(".tools/sing-box.tar.gz")
-          urllib.request.urlretrieve(asset_url, archive_path)
-          subprocess.run(["tar", "-xzf", str(archive_path), "-C", ".tools"], check=True)
-
-          binary_path = None
-          for candidate in Path(".tools").rglob("sing-box"):
-              if candidate.is_file():
-                  binary_path = candidate
-                  break
-          if binary_path is None:
-              raise SystemExit("Unable to locate sing-box binary after extraction")
-
-          binary_path.chmod(0o755)
-          print(f"Downloaded sing-box to {binary_path}")
-          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fh:
-              fh.write(str(binary_path.parent) + "\n")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
-              fh.write(f"SINGBOX_BIN={binary_path}\n")
-          PY
+          # 用带 GITHUB_TOKEN 认证的 gh api 调用，避免未认证 60/小时限流（403）
+          asset_url=$(gh api repos/SagerNet/sing-box/releases/latest \
+            --jq '.assets[] | select(.name | (endswith(".tar.gz")) and (contains("linux-amd64"))) | .browser_download_url' \
+            | head -n1)
+          if [ -z "${asset_url:-}" ]; then
+            echo "未找到 sing-box linux-amd64 发布资产"
+            exit 1
+          fi
+          curl -fsSL --retry 3 -o .tools/sing-box.tar.gz "$asset_url"
+          tar -xzf .tools/sing-box.tar.gz -C .tools
+          binary_path=$(find .tools -type f -name sing-box | head -n1)
+          if [ -z "${binary_path:-}" ]; then
+            echo "解压后未找到 sing-box 可执行文件"
+            exit 1
+          fi
+          chmod 755 "$binary_path"
+          echo "Downloaded sing-box to $binary_path"
+          echo "$(dirname "$binary_path")" >> "$GITHUB_PATH"
+          echo "SINGBOX_BIN=$binary_path" >> "$GITHUB_ENV"
 
       - name: Prepare account config
         env:
@@ -134,9 +115,32 @@ jobs:
           SINGBOX_BIN: ${{ env.SINGBOX_BIN }}
           TG_BOT_TOKEN: ${{ env.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ env.TG_CHAT_ID }}
+          # 读入上次保存的登录会话，脚本会优先复用免登录，失效则自动重新登录
+          IAMHC_SESSIONS: ${{ vars.IAMHC_SESSIONS }}
         run: |
-          echo "ACCOUNTS_JSON=$ACCOUNTS_JSON"
           python checkin.py
+
+      - name: Save login sessions
+        if: always()
+        env:
+          # 优先用加密 PAT（有 variables:write 权限）稳定写回；未配置则回退默认 token
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          IAMHC_SESSIONS_UPDATE: ${{ env.IAMHC_SESSIONS_UPDATE }}
+        run: |
+          # 会话以加密仓库变量形式持久化（非明文文件），供下次运行复原登录、跳过 2FA
+          if [ -z "${IAMHC_SESSIONS_UPDATE:-}" ]; then
+            echo "本次无会话更新，跳过保存"
+            exit 0
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "⚠️ 未获取到任何 token，无法保存会话，本次会话仅当次有效"
+            exit 0
+          fi
+          if gh variable set IAMHC_SESSIONS --body "$IAMHC_SESSIONS_UPDATE"; then
+            echo "登录会话已保存到仓库变量 IAMHC_SESSIONS，下次运行将复用免登录"
+          else
+            echo "⚠️ 写入仓库变量失败：请配置 secrets.GH_PAT（细粒度 PAT，授予本仓库 Variables 读写权限），会话仅本次有效"
+          fi
 
       - name: Write time marker
         if: always()
