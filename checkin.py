@@ -245,6 +245,32 @@ def export_session_store(store):
         print("保存会话到 GITHUB_ENV 失败:", exc)
 
 
+def save_session_cookie(session, store, account_index, user=None):
+    """登录成功后把会话 cookie 记录到 store；user 为 None 时删除该账号旧会话。"""
+    if store is None:
+        return
+    key = str(account_index)
+    if user is None:
+        store.pop(key, None)
+        return
+    for cookie in session.cookies:
+        if cookie.name == SESSION_COOKIE_NAME:
+            store[key] = {
+                "cookie": cookie.value,
+                "user_id": user.get("id"),
+                "username": user.get("username") or "",
+            }
+            return
+
+
+def restore_session_cookie(session, saved):
+    """把保存的会话 cookie 装回 session；格式异常返回 False。"""
+    if not isinstance(saved, dict) or not saved.get("cookie") or not saved.get("user_id"):
+        return False
+    session.cookies.set(SESSION_COOKIE_NAME, saved["cookie"], domain=COOKIE_DOMAIN, path="/")
+    return True
+
+
 def resolve_singbox_path(path):
     if not path:
         return ""
@@ -465,16 +491,16 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
         extracted = _extract_user_info(data)
         if extracted and extracted.get("id") not in (None, ""):
             print(f"✅ 2FA 验证成功 | 账户: {mask_username(extracted['username'])}")
-            return extracted
+            return extracted, False
         print("2FA 认证成功但未能解析到用户信息，响应体如下:")
         print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
-        return None
+        return None, False
 
     print(f"❌ 2FA 验证码全部被拒绝，最后响应：{last_message}")
     print("   排查建议：核对 OTP_SECRET 是否为该账号两步验证的密钥")
     print("   （若复制的是 otpauth:// 链接，请填其中的 secret 参数值），")
     print("   并用手机验证器当前 6 位数字与上方日志中的验证码比对确认。")
-    return None
+    return None, False
 
 
 def login(session: requests.Session, email, password, otp_secret="", use_proxy=False):
@@ -531,7 +557,8 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
                 print("登录需要 2FA，但未提供 OTP_SECRET")
                 return None, 200
             print("🔐 检测到 2FA，正在自动提交验证码...")
-            return _submit_otp_code(session, email, password, otp_secret, payload), 200
+            otp_user, locked = _submit_otp_code(session, email, password, otp_secret, payload)
+            return otp_user, (LOCKED if locked else 200)
 
         extracted = _extract_user_info(data)
         if extracted and extracted.get("id") not in (None, ""):
@@ -541,17 +568,22 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
         print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
         return None, 200
 
+    message = str(data.get("message") or "")
+    if "锁定" in message:
+        print("🔒 账户被临时锁定:", message)
+        return None, LOCKED
+
     if not otp_secret:
         print("登录失败:", data.get("message", ""))
         return None, 200
 
-    message = str(data.get("message") or "")
     if "2fa" not in message.lower() and "otp" not in message.lower() and "验证码" not in message:
         print("登录失败:", data.get("message", ""))
         return None, 200
 
     print("🔐 检测到 2FA，正在自动提交验证码...")
-    return _submit_otp_code(session, email, password, otp_secret, payload), 200
+    otp_user, locked = _submit_otp_code(session, email, password, otp_secret, payload)
+    return otp_user, (LOCKED if locked else 200)
 
 
 def get_user_info(session: requests.Session, user_id):
@@ -642,133 +674,173 @@ def build_summary_message(results):
     return "🎁 iamhc 签到汇总\n\n" + "\n".join(summary_lines)
 
 
-def run_account(account, account_index, total_accounts):
+def _fail(masked_username, detail):
+    return {
+        "masked_username": masked_username,
+        "status": "failed",
+        "detail": detail,
+        "balance_before": 0,
+        "balance_after": 0,
+        "awarded": 0,
+    }
+
+
+def do_checkin(session, user):
+    """登录成功后的签到与余额查询，返回结果字典。"""
+    user_id = user["id"]
+    username = user.get("username", str(user_id))
+    masked_username = mask_username(username)
+
+    info_before = get_user_info(session, user_id)
+    if not info_before:
+        print("获取用户信息失败")
+        return _fail(masked_username, "获取用户信息失败")
+    balance_before = quota_to_dollar(info_before.get("quota", 0))
+
+    checkin_data = checkin(session, user_id)
+    info_after = get_user_info(session, user_id)
+    if not info_after:
+        print("获取签到后用户信息失败")
+        return _fail(masked_username, "获取签到后用户信息失败")
+    balance_after = quota_to_dollar(info_after.get("quota", 0))
+
+    success = checkin_data.get("success", False)
+    msg = str(checkin_data.get("message", ""))
+
+    if success:
+        awarded_data = checkin_data.get("data", {})
+        awarded_quota = awarded_data.get("quota_awarded", 0)
+        awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
+        log_summary = f"✅ 签到成功 | 账户: {masked_username}"
+        print("\n" + "=" * 25)
+        print(log_summary)
+        print("=" * 25)
+        return {
+            "masked_username": masked_username,
+            "status": "success",
+            "detail": msg,
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+            "awarded": awarded_dollar,
+        }
+    if "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
+        log_summary = f"✅ 今日已签到 | 账户: {masked_username}"
+        print("\n" + "=" * 25)
+        print(log_summary)
+        print("=" * 25)
+        return {
+            "masked_username": masked_username,
+            "status": "checked",
+            "detail": msg,
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+            "awarded": 0,
+        }
+    log_summary = f"❌ 签到失败 | 账户: {masked_username} | {msg}"
+    print("\n" + "=" * 25)
+    print(log_summary)
+    print("=" * 25)
+    return {
+        "masked_username": masked_username,
+        "status": "failed",
+        "detail": msg,
+        "balance_before": balance_before,
+        "balance_after": balance_after,
+        "awarded": 0,
+    }
+
+
+def run_account(account, account_index, total_accounts, saved_session=None, session_store=None):
     email = account.get("email", "")
     password = account.get("password", "")
     if not email or not password:
         print(f"⚠️ 账号 {account_index}/{total_accounts} 缺少邮箱或密码，跳过")
-        return
+        return None
 
-    proxy_process = None
-    temp_dir = None
-    proxy_ready = False
-    try:
-        proxy_process, temp_dir = start_local_proxy(account, account_index, total_accounts)
-        proxy_ready = proxy_process is not None
-        session = build_session(account, proxy_ready=proxy_ready)
+    proxy_state = {"process": None, "temp_dir": None}
 
-        if proxy_ready:
-            proxy_ip = fetch_exit_ip({"http": LOCAL_PROXY_URL, "https": LOCAL_PROXY_URL})
-            if proxy_ip:
-                print(f"🌐 代理出口IP: {mask_ip(proxy_ip)} （已打码，用于排查代理连通性）")
-            else:
-                print("⚠️ 无法通过代理获取出口IP，代理节点可能不可用或已失效")
+    def cleanup_proxy():
+        if proxy_state["process"] is not None:
+            stop_local_proxy(proxy_state["process"], proxy_state["temp_dir"])
+        proxy_state["process"] = None
+        proxy_state["temp_dir"] = None
 
-        user, status = login(
-            session,
-            email,
-            password,
-            account.get("otp_secret") or os.environ.get("OTP_SECRET", ""),
-            use_proxy=proxy_ready,
-        )
-        if not user and status in (429, CONN_ERROR) and proxy_ready:
-            print("代理链路异常（限流或连接失败），尝试关代理直连")
-            stop_local_proxy(proxy_process, temp_dir)
-            proxy_process = None
-            proxy_ready = False
-            session = build_session(account, proxy_ready=proxy_ready)
-            user, status = login(
-                session,
-                email,
-                password,
-                account.get("otp_secret") or os.environ.get("OTP_SECRET", ""),
-                use_proxy=False,
+    def attempt(reuse_session):
+        """执行一轮 起代理→(复用会话/登录)→签到，返回 (result 或 None, status)。"""
+        try:
+            proxy_state["process"], proxy_state["temp_dir"] = start_local_proxy(
+                account, account_index, total_accounts
             )
+            proxy_ready = proxy_state["process"] is not None
+            session = build_session(account, proxy_ready=proxy_ready)
 
-        if not user:
-            if status == CONN_ERROR:
-                detail = "登录失败: 代理与直连均无法连接"
-            elif status == 429:
-                detail = "登录失败: 请求被限流(429)"
-            else:
-                detail = "登录失败: 凭据或 2FA 验证问题"
-            print(f"\n{detail}，无法继续签到")
-            return {
-                "masked_username": mask_username(email or "未知账号"),
-                "status": "failed",
-                "detail": detail,
-                "balance_before": 0,
-                "balance_after": 0,
-                "awarded": 0,
-            }
+            if proxy_ready:
+                proxy_ip = fetch_exit_ip({"http": LOCAL_PROXY_URL, "https": LOCAL_PROXY_URL})
+                if proxy_ip:
+                    print(f"🌐 代理出口IP: {mask_ip(proxy_ip)} （已打码，用于排查代理连通性）")
+                else:
+                    print("⚠️ 无法通过代理获取出口IP，代理节点可能不可用或已失效")
 
-        user_id = user["id"]
-        username = user.get("username", str(user_id))
-        masked_username = mask_username(username)
+            otp_secret = account.get("otp_secret") or os.environ.get("OTP_SECRET", "")
+            user = None
 
-        info_before = get_user_info(session, user_id)
-        if not info_before:
-            print("获取用户信息失败")
-            return
-        balance_before = quota_to_dollar(info_before.get("quota", 0))
+            # 1) 优先复用上次保存的登录会话，避免每次登录和 2FA
+            if reuse_session and restore_session_cookie(session, saved_session):
+                probe_id = saved_session.get("user_id")
+                user = {"id": probe_id, "username": saved_session.get("username") or ""}
+                info = get_user_info(session, probe_id)
+                if info:
+                    print(f"♻️ 复用已保存登录会话，跳过登录与 2FA | 账户: {mask_username(info.get('username') or user['username'])}")
+                else:
+                    print("已保存会话已失效，转入正常登录")
+                    user = None
+                    save_session_cookie(None, session_store, account_index)
 
-        checkin_data = checkin(session, user_id)
-        info_after = get_user_info(session, user_id)
-        if not info_after:
-            print("获取签到后用户信息失败")
-            return
-        balance_after = quota_to_dollar(info_after.get("quota", 0))
+            # 2) 完整登录（可能触发 2FA）
+            if user is None:
+                user, login_status = login(session, email, password, otp_secret, use_proxy=proxy_ready)
+                if not user and login_status in (429, CONN_ERROR) and proxy_ready:
+                    print("代理链路异常（限流或连接失败），尝试关代理直连")
+                    cleanup_proxy()
+                    session = build_session(account, proxy_ready=False)
+                    user, login_status = login(session, email, password, otp_secret, use_proxy=False)
+                if not user:
+                    save_session_cookie(None, session_store, account_index)
+                    return None, (login_status if login_status in (LOCKED, CONN_ERROR) else "failed")
 
-        local_time = time.gmtime(time.time() + 8 * 3600)
-        now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-        success = checkin_data.get("success", False)
-        msg = str(checkin_data.get("message", ""))
+            # 登录成功，记录当前会话供下次复用
+            save_session_cookie(session, session_store, account_index, user)
+            return do_checkin(session, user), "ok"
+        finally:
+            cleanup_proxy()
 
-        if success:
-            awarded_data = checkin_data.get("data", {})
-            awarded_quota = awarded_data.get("quota_awarded", 0)
-            awarded_dollar = quota_to_dollar(awarded_quota) if awarded_quota else (balance_after - balance_before)
-            log_summary = f"✅ 签到成功 | 账户: {masked_username}"
-            print("\n" + "=" * 25)
-            print(log_summary)
-            print("=" * 25)
-            return {
-                "masked_username": masked_username,
-                "status": "success",
-                "detail": msg,
-                "balance_before": balance_before,
-                "balance_after": balance_after,
-                "awarded": awarded_dollar,
-            }
-        elif "已签到" in msg or "重复签到" in msg or "今天已签到" in msg:
-            log_summary = f"✅ 今日已签到 | 账户: {masked_username}"
-            print("\n" + "=" * 25)
-            print(log_summary)
-            print("=" * 25)
-            return {
-                "masked_username": masked_username,
-                "status": "checked",
-                "detail": msg,
-                "balance_before": balance_before,
-                "balance_after": balance_after,
-                "awarded": 0,
-            }
+    try:
+        result, status = attempt(reuse_session=True)
+
+        # 3) 2FA 锁定：保持本次运行等待 16 分钟后再尝试一次
+        if status == LOCKED:
+            wait_minutes = 16
+            until = time.strftime("%H:%M:%S", time.gmtime(time.time() + wait_minutes * 60 + 8 * 3600))
+            print(f"\n⏳ 账户被 2FA 临时锁定，保持运行 {wait_minutes} 分钟后自动重试一次（约北京时间 {until}）")
+            time.sleep(wait_minutes * 60)
+            print("锁定等待结束，重新尝试登录")
+            result, status = attempt(reuse_session=False)
+
+        if result is not None:
+            return result
+
+        if status == CONN_ERROR:
+            detail = "登录失败: 代理与直连均无法连接"
+        elif status == LOCKED:
+            detail = "登录失败: 2FA 锁定，重试仍未成功（请核对 OTP_SECRET）"
+        elif status == 429:
+            detail = "登录失败: 请求被限流(429)"
         else:
-            log_summary = f"❌ 签到失败 | 账户: {masked_username} | {msg}"
-            print("\n" + "=" * 25)
-            print(log_summary)
-            print("=" * 25)
-            return {
-                "masked_username": masked_username,
-                "status": "failed",
-                "detail": msg,
-                "balance_before": balance_before,
-                "balance_after": balance_after,
-                "awarded": 0,
-            }
+            detail = "登录失败: 凭据或 2FA 验证问题"
+        print(f"\n{detail}，无法继续签到")
+        return _fail(mask_username(email or "未知账号"), detail)
     finally:
-        if proxy_process is not None:
-            stop_local_proxy(proxy_process, temp_dir)
+        cleanup_proxy()
 
 
 def main():
@@ -784,33 +856,31 @@ def main():
     else:
         print("⚠️ 未能获取本机直连出口IP")
 
+    session_store = load_session_store()
+    if session_store:
+        print(f"🍪 已加载 {len(session_store)} 个上次保存的登录会话，将优先复用免登录")
+
     results = []
     for index, account in enumerate(accounts, 1):
         print(f"\n===== 账号 {index}/{len(accounts)} =====")
         try:
-            result = run_account(account, index, len(accounts))
+            result = run_account(
+                account,
+                index,
+                len(accounts),
+                saved_session=session_store.get(str(index)),
+                session_store=session_store,
+            )
         except requests.RequestException as exc:
             print(f"❌ 账号处理被网络异常中断: {exc.__class__.__name__}: {exc}")
-            result = {
-                "masked_username": mask_username(account.get("email", "") or "未知账号"),
-                "status": "failed",
-                "detail": f"网络异常: {exc.__class__.__name__}",
-                "balance_before": 0,
-                "balance_after": 0,
-                "awarded": 0,
-            }
+            result = _fail(mask_username(account.get("email", "") or "未知账号"), f"网络异常: {exc.__class__.__name__}")
         except Exception as exc:
             print(f"❌ 账号处理出现未预期异常: {exc.__class__.__name__}: {exc}")
-            result = {
-                "masked_username": mask_username(account.get("email", "") or "未知账号"),
-                "status": "failed",
-                "detail": f"异常: {exc.__class__.__name__}",
-                "balance_before": 0,
-                "balance_after": 0,
-                "awarded": 0,
-            }
+            result = _fail(mask_username(account.get("email", "") or "未知账号"), f"异常: {exc.__class__.__name__}")
         if result:
             results.append(result)
+        # 每个账号处理完即写回最新会话，供工作流用 gh variable set 持久化
+        export_session_store(session_store)
 
     summary_message = build_summary_message(results)
     if summary_message:
