@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -26,11 +26,74 @@ TURNSTILE_TOKEN = ""
 LOCAL_PROXY_URL = os.environ.get("LOCAL_PROXY_URL", "http://127.0.0.1:8080").strip()
 OTP_SECRET = os.environ.get("OTP_SECRET", "").strip()
 
+# 连接层异常（超时/被重置等）时的返回标记，区别于 HTTP 状态码
+CONN_ERROR = "conn_error"
+# 2FA 账户锁定标记
+LOCKED = "locked"
+
+# 登录会话复用：从仓库变量 IAMHC_SESSIONS 读取上次会话，运行结束后由工作流
+# 用 gh variable set 写回（避免明文写入仓库文件）。
+SESSIONS_ENV = "IAMHC_SESSIONS"
+SESSIONS_UPDATE_ENV = "IAMHC_SESSIONS_UPDATE"
+SESSION_COOKIE_NAME = "session"
+COOKIE_DOMAIN = urlparse(BASE_URL).hostname or ""
+
+# 出口 IP 检测服务（用于排查代理是否生效，输出打码 IP）
+IP_CHECK_URLS = (
+    "https://api.ipify.org?format=json",
+    "https://api.ip.sb/json/ip",
+    "http://ip-api.com/json/",
+)
+
+
+def mask_ip(ip):
+    """将出口 IP 打码显示（如 192.*.*.100），方便排查代理又不泄露完整地址。"""
+    ip = str(ip).strip()
+    if ":" not in ip and ip.count(".") == 3:
+        first, _, rest = ip.partition(".")
+        last = rest.rsplit(".", 1)[-1]
+        return f"{first}.*.*.{last}"
+    if ":" in ip:
+        groups = [g for g in ip.split(":") if g]
+        if len(groups) >= 3:
+            return f"{groups[0]}:{groups[1]}:*:*:{groups[-1]}"
+    return "*"
+
+
+def fetch_exit_ip(proxies=None, timeout=10):
+    """通过指定代理（None 表示直连）访问 IP 回显服务，返回出口 IP 或 None。"""
+    session = requests.Session()
+    session.trust_env = False
+    if proxies:
+        session.proxies.update(proxies)
+    for url in IP_CHECK_URLS:
+        try:
+            resp = session.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            for key in ("ip", "query", "ipAddress", "ip_addr"):
+                if data.get(key):
+                    return str(data[key]).strip()
+        except requests.RequestException:
+            continue
+    return None
+
 
 def normalize_secret(secret: str) -> str:
     if not secret:
         return ""
-    cleaned = re.sub(r"[\s\-_=]+", "", str(secret).strip()).upper()
+    secret = str(secret).strip()
+    # 支持 otpauth:// 链接：自动提取其中的 secret 参数
+    if secret.lower().startswith("otpauth://"):
+        try:
+            secret = (parse_qs(urlparse(secret).query).get("secret") or [""])[0]
+        except Exception:
+            return ""
+    cleaned = re.sub(r"[\s\-_=]+", "", secret).upper()
     if not cleaned:
         return ""
     return cleaned
@@ -52,7 +115,7 @@ def mask_username(username: str) -> str:
     return username[0] + "*" * (len(username) - 2) + username[-1]
 
 
-def generate_totp_code(secret: str, digits: int = 6, period: int = 30):
+def generate_totp_code(secret: str, digits: int = 6, period: int = 30, at=None):
     secret = (secret or OTP_SECRET or "").strip()
     if not secret:
         return ""
@@ -69,7 +132,7 @@ def generate_totp_code(secret: str, digits: int = 6, period: int = 30):
     else:
         secret_bytes = secret.encode("utf-8")
 
-    timestamp = int(time.time()) // period
+    timestamp = int(at if at is not None else time.time()) // period
     msg = timestamp.to_bytes(8, "big")
     digest = hmac.new(secret_bytes, msg, hashlib.sha1).digest()
     offset = digest[-1] & 0x0F
@@ -152,6 +215,34 @@ def build_session(account, proxy_ready=False):
         session.proxies = {}
         print("🔓 代理未就绪，将直接连接")
     return session
+
+
+def load_session_store():
+    """从环境变量读取上次保存的登录会话：{账号序号: {cookie, user_id, username}}。"""
+    raw = os.environ.get(SESSIONS_ENV, "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        print("⚠️ 已保存会话数据解析失败，将全部重新登录")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def export_session_store(store):
+    """把最新会话写入 GITHUB_ENV，由工作流用 gh variable set 写回仓库变量。
+
+    不打印内容，避免会话泄露到运行日志。
+    """
+    github_env = os.environ.get("GITHUB_ENV")
+    if not github_env or not store:
+        return
+    try:
+        with open(github_env, "a", encoding="utf-8") as fh:
+            fh.write(f"{SESSIONS_UPDATE_ENV}={json.dumps(store, ensure_ascii=False)}\n")
+    except OSError as exc:
+        print("保存会话到 GITHUB_ENV 失败:", exc)
 
 
 def resolve_singbox_path(path):
@@ -271,12 +362,37 @@ def _extract_user_info(payload):
     return None
 
 
-def _submit_otp_code(session: requests.Session, email, password, otp_secret, payload):
-    code = generate_totp_code(otp_secret)
-    if not code:
-        print("未能生成 2FA 验证码，请检查 OTP_SECRET")
-        return None
+def _login_pending_2fa(session: requests.Session, email, password, headers):
+    """重新执行密码登录，建立"待 2FA 验证"的服务端会话。"""
+    login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
+    try:
+        resp = session.post(login_url, headers=headers, json={"username": email, "password": password}, timeout=20)
+    except requests.RequestException as exc:
+        return False, {"message": f"网络异常: {exc.__class__.__name__}"}
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+    pending = (
+        data.get("success") is True
+        and isinstance(data.get("data"), dict)
+        and data["data"].get("require_2fa")
+    )
+    return pending, data
 
+
+def _submit_otp_code(session: requests.Session, email, password, otp_secret, payload):
+    """提交 2FA 验证码。
+
+    站点真实流程（已抓包验证）：
+      1. POST /api/user/login {username, password} -> {"data":{"require_2fa":true},"success":true}
+         同时下发 session cookie（保存待验证状态）
+      2. POST /api/user/login/2fa {"code": "123456"} -> 成功时 data 即用户信息
+    只需要 code 一个字段，凭证由会话承载。验证码错误返回
+    {"message":"验证码或备用码不正确","success":false}，且会话在失败后仍然有效。
+
+    返回 (user 或 None, 是否因账户锁定而中止)。
+    """
     otp_headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -284,55 +400,80 @@ def _submit_otp_code(session: requests.Session, email, password, otp_secret, pay
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/otp",
     }
+    endpoint = f"{BASE_URL}/api/user/login/2fa"
 
-    otp_payload_candidates = [
-        {"username": email, "password": password, "otp": code},
-        {"username": email, "password": password, "code": code},
-        {"otp": code},
-        {"code": code},
+    base_ts = int(time.time())
+    # 依次尝试 当前/上一/下一 时间窗，容忍与服务器 30s 内的时钟偏差
+    windows = [
+        ("当前时间窗", base_ts),
+        ("上一时间窗", base_ts - 30),
+        ("下一时间窗", base_ts + 30),
     ]
 
-    otp_endpoints = [
-        f"{BASE_URL}/api/user/login/2fa",
-        f"{BASE_URL}/api/user/otp",
-        f"{BASE_URL}/otp",
-        f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}",
-    ]
+    last_message = ""
+    for label, ts in windows:
+        code = generate_totp_code(otp_secret, at=ts)
+        if not code:
+            print("未能生成 2FA 验证码，请检查 OTP_SECRET")
+            return None, False
 
-    last_error = None
-    for endpoint in otp_endpoints:
-        for index, candidate in enumerate(otp_payload_candidates, 1):
-            body = {**payload, **candidate} if endpoint.endswith("login?turnstile=" + quote(TURNSTILE_TOKEN)) else candidate
-            otp_resp = session.post(
-                endpoint,
-                headers=otp_headers,
-                json=body,
-                timeout=20,
-            )
+        print(f"📡 提交 2FA | {label} | 验证码 {code} (可与手机验证器比对)")
+        try:
+            resp = session.post(endpoint, headers=otp_headers, json={"code": code}, timeout=20)
+        except requests.RequestException as exc:
+            last_message = f"网络异常: {exc.__class__.__name__}"
+            print(f"   ↳ {last_message}")
+            continue
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        print(f"   ↳ 响应 {resp.status_code}: {json.dumps(data, ensure_ascii=False)[:200]}")
+        last_message = str(data.get("message") or "")
+
+        if "锁定" in last_message or "稍后再试" in last_message:
+            # 站点对连续验证码错误有临时锁定机制，继续重试只会延长锁定
+            print("⚠️ 账户因多次验证码错误被临时锁定，停止重试，请稍后运行并核对 OTP_SECRET")
+            return None, True
+
+        if data.get("success") is not True:
+            # 验证码被拒（验证码或备用码不正确等），换下一个时间窗
+            continue
+
+        if isinstance(data.get("data"), dict) and data["data"].get("require_2fa"):
+            # 服务端丢失了待验证会话：重新登录建立会话后，用同一验证码重试
+            print("   ↳ 服务端仍要求 2FA（会话状态丢失），重新登录后重试")
+            pending, redata = _login_pending_2fa(session, email, password, otp_headers)
+            if not pending:
+                print("   ↳ 重新登录失败:", json.dumps(redata, ensure_ascii=False)[:200])
+                return None, False
             try:
-                otp_data = otp_resp.json()
+                resp = session.post(endpoint, headers=otp_headers, json={"code": code}, timeout=20)
+            except requests.RequestException as exc:
+                last_message = f"网络异常: {exc.__class__.__name__}"
+                print(f"   ↳ {last_message}")
+                continue
+            try:
+                data = resp.json()
             except ValueError:
-                otp_data = {}
+                data = {}
+            print(f"   ↳ 重试响应 {resp.status_code}: {json.dumps(data, ensure_ascii=False)[:200]}")
+            last_message = str(data.get("message") or "")
+            if data.get("success") is not True:
+                continue
 
-            if otp_data.get("success") is True:
-                if isinstance(otp_data.get("data"), dict) and otp_data["data"].get("require_2fa"):
-                    last_error = f"{endpoint} payload={list(candidate.keys())} message=继续要求 2FA"
-                    continue
-                extracted = _extract_user_info(otp_data)
-                if extracted and extracted.get("id") not in (None, ""):
-                    print(f"✅ 2FA 验证成功 | 账户: {mask_username(extracted['username'])}")
-                    return extracted
-                print("2FA 认证成功但未能解析到用户信息，响应体如下:")
-                print(json.dumps(otp_data, ensure_ascii=False, indent=2)[:2000])
-                return None
+        extracted = _extract_user_info(data)
+        if extracted and extracted.get("id") not in (None, ""):
+            print(f"✅ 2FA 验证成功 | 账户: {mask_username(extracted['username'])}")
+            return extracted
+        print("2FA 认证成功但未能解析到用户信息，响应体如下:")
+        print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+        return None
 
-            if otp_resp.status_code == 200 and otp_data.get("message"):
-                last_error = f"{endpoint} payload={list(candidate.keys())} message={otp_data.get('message')}"
-
-    if last_error:
-        print("2FA 提交失败，最后一次响应：", last_error)
-    else:
-        print("2FA 验证失败，登录流程未完成")
+    print(f"❌ 2FA 验证码全部被拒绝，最后响应：{last_message}")
+    print("   排查建议：核对 OTP_SECRET 是否为该账号两步验证的密钥")
+    print("   （若复制的是 otpauth:// 链接，请填其中的 secret 参数值），")
+    print("   并用手机验证器当前 6 位数字与上方日志中的验证码比对确认。")
     return None
 
 
@@ -350,8 +491,17 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
 
     payload = {"username": email, "password": password}
     max_attempts = 1 if use_proxy else 3
-    for attempt in range(1, max_attempts + 1):
-        resp = session.post(login_url, headers=headers, json=payload, timeout=20)
+    resp = None
+    for attempt in range(1, 4):
+        try:
+            resp = session.post(login_url, headers=headers, json=payload, timeout=20)
+        except requests.RequestException as exc:
+            # 连接类异常（超时/被重置等）与限流无关，无论是否走代理都重试
+            print(f"登录请求网络异常 (第 {attempt}/3 次): {exc.__class__.__name__}: {exc}")
+            if attempt < 3:
+                time.sleep(2)
+                continue
+            return None, CONN_ERROR
         if resp.status_code != 429:
             break
         if use_proxy:
@@ -361,7 +511,7 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
         print(f"登录请求被限流 (429)，第 {attempt}/{max_attempts} 次重试，等待 {wait_seconds}s...")
         time.sleep(wait_seconds)
 
-    if resp.status_code == 429:
+    if resp is None or resp.status_code == 429:
         print("登录请求仍然被限流，建议切换直连或降低请求频率")
         return None, 429
 
@@ -416,7 +566,10 @@ def get_user_info(session: requests.Session, user_id):
     }
 
     resp = session.get(url, headers=headers, timeout=20)
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
     if data.get("success"):
         return data.get("data", {})
     return None
@@ -504,6 +657,13 @@ def run_account(account, account_index, total_accounts):
         proxy_ready = proxy_process is not None
         session = build_session(account, proxy_ready=proxy_ready)
 
+        if proxy_ready:
+            proxy_ip = fetch_exit_ip({"http": LOCAL_PROXY_URL, "https": LOCAL_PROXY_URL})
+            if proxy_ip:
+                print(f"🌐 代理出口IP: {mask_ip(proxy_ip)} （已打码，用于排查代理连通性）")
+            else:
+                print("⚠️ 无法通过代理获取出口IP，代理节点可能不可用或已失效")
+
         user, status = login(
             session,
             email,
@@ -511,8 +671,8 @@ def run_account(account, account_index, total_accounts):
             account.get("otp_secret") or os.environ.get("OTP_SECRET", ""),
             use_proxy=proxy_ready,
         )
-        if status == 429 and proxy_ready:
-            print("检测到代理导致登录限流，尝试关代理直连")
+        if not user and status in (429, CONN_ERROR) and proxy_ready:
+            print("代理链路异常（限流或连接失败），尝试关代理直连")
             stop_local_proxy(proxy_process, temp_dir)
             proxy_process = None
             proxy_ready = False
@@ -526,8 +686,21 @@ def run_account(account, account_index, total_accounts):
             )
 
         if not user:
-            print("\n登录失败，无法继续签到")
-            return
+            if status == CONN_ERROR:
+                detail = "登录失败: 代理与直连均无法连接"
+            elif status == 429:
+                detail = "登录失败: 请求被限流(429)"
+            else:
+                detail = "登录失败: 凭据或 2FA 验证问题"
+            print(f"\n{detail}，无法继续签到")
+            return {
+                "masked_username": mask_username(email or "未知账号"),
+                "status": "failed",
+                "detail": detail,
+                "balance_before": 0,
+                "balance_after": 0,
+                "awarded": 0,
+            }
 
         user_id = user["id"]
         username = user.get("username", str(user_id))
@@ -605,16 +778,47 @@ def main():
         sys.exit(1)
 
     print(f"共发现 {len(accounts)} 个账号配置")
+    direct_ip = fetch_exit_ip()
+    if direct_ip:
+        print(f"🏠 本机直连出口IP: {mask_ip(direct_ip)} （对照用：若与代理出口IP相同说明代理未生效）")
+    else:
+        print("⚠️ 未能获取本机直连出口IP")
+
     results = []
     for index, account in enumerate(accounts, 1):
         print(f"\n===== 账号 {index}/{len(accounts)} =====")
-        result = run_account(account, index, len(accounts))
+        try:
+            result = run_account(account, index, len(accounts))
+        except requests.RequestException as exc:
+            print(f"❌ 账号处理被网络异常中断: {exc.__class__.__name__}: {exc}")
+            result = {
+                "masked_username": mask_username(account.get("email", "") or "未知账号"),
+                "status": "failed",
+                "detail": f"网络异常: {exc.__class__.__name__}",
+                "balance_before": 0,
+                "balance_after": 0,
+                "awarded": 0,
+            }
+        except Exception as exc:
+            print(f"❌ 账号处理出现未预期异常: {exc.__class__.__name__}: {exc}")
+            result = {
+                "masked_username": mask_username(account.get("email", "") or "未知账号"),
+                "status": "failed",
+                "detail": f"异常: {exc.__class__.__name__}",
+                "balance_before": 0,
+                "balance_after": 0,
+                "awarded": 0,
+            }
         if result:
             results.append(result)
 
     summary_message = build_summary_message(results)
     if summary_message:
         send_notification(summary_message, log_summary=f"✅ 签到汇总 | {len(results)} 账号")
+
+    # 全部账号失败时以非零码退出，让 Actions 运行显示为失败便于察觉
+    if results and all(r.get("status") == "failed" for r in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
