@@ -26,15 +26,28 @@ TURNSTILE_TOKEN = ""
 LOCAL_PROXY_URL = os.environ.get("LOCAL_PROXY_URL", "http://127.0.0.1:8080").strip()
 OTP_SECRET = os.environ.get("OTP_SECRET", "").strip()
 
+# 2FA 验证码被拒后的自动重试次数（默认重试 2 次，加上首次共提交 3 次）
+try:
+    OTP_RETRY_TIMES = max(0, int(os.environ.get("OTP_RETRY_TIMES", "2")))
+except ValueError:
+    OTP_RETRY_TIMES = 2
+
+# 2FA 提交时依次尝试的时间窗偏移：当前 / 上一 / 下一，容忍与服务器的时钟偏差
+OTP_WINDOW_OFFSETS = (0, -30, 30)
+
 # 连接层异常（超时/被重置等）时的返回标记，区别于 HTTP 状态码
 CONN_ERROR = "conn_error"
 # 2FA 账户锁定标记
 LOCKED = "locked"
+# 访问令牌无效 / 已失效标记
+TOKEN_INVALID = "token_invalid"
 
 # 登录会话复用：从仓库变量 IAMHC_SESSIONS 读取上次会话，运行结束后由工作流
 # 用 gh variable set 写回（避免明文写入仓库文件）。
 SESSIONS_ENV = "IAMHC_SESSIONS"
 SESSIONS_UPDATE_ENV = "IAMHC_SESSIONS_UPDATE"
+# 新版 new-api 用刷新令牌 Cookie 承载长会话（旧版为 session Cookie）
+REFRESH_COOKIE_NAME = "new_api_refresh"
 SESSION_COOKIE_NAME = "session"
 COOKIE_DOMAIN = urlparse(BASE_URL).hostname or ""
 
@@ -141,6 +154,58 @@ def generate_totp_code(secret: str, digits: int = 6, period: int = 30, at=None):
     return code
 
 
+def parse_atoken(raw):
+    """解析系统访问令牌配置，支持以下写法（也支持 JSON 对象）：
+
+        id,name,token   -> 推荐写法，例如 12,张三,AbCdEf123...
+        id,token        -> 省略用户名
+        token           -> 仅令牌（用户 ID 由服务端返回）
+
+    返回 {"id": str, "name": str, "token": str}；没有有效令牌时返回 None。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        token = str(obj.get("token") or obj.get("access_token") or obj.get("atoken") or "").strip()
+        token = re.sub(r"^Bearer\s+", "", token, flags=re.I)
+        if not token:
+            return None
+        user_id = obj.get("id", obj.get("user_id", obj.get("uid", "")))
+        name = str(obj.get("name") or obj.get("username") or "").strip()
+        return {"id": str(user_id).strip() if user_id not in (None, "") else "", "name": name, "token": token}
+
+    parts = [part.strip() for part in re.split(r"[,，]", raw) if part.strip()]
+    if not parts:
+        return None
+
+    user_id = ""
+    name = ""
+    if len(parts) >= 3:
+        user_id, name = parts[0], parts[1]
+        token = ",".join(parts[2:]).strip()
+    elif len(parts) == 2:
+        # 两段式：以「纯数字」的一段判定为用户 ID
+        if parts[0].isdigit():
+            user_id, token = parts[0], parts[1]
+        else:
+            name, token = parts[0], parts[1]
+    else:
+        token = parts[0]
+
+    token = re.sub(r"^Bearer\s+", "", token.strip(), flags=re.I)
+    if not token:
+        return None
+    return {"id": user_id, "name": name, "token": token}
+
+
 def load_accounts_from_env():
     """从环境变量加载账号配置，支持 ACCOUNTS_JSON、EMAIL_1/2/3... 和兼容单账号模式。"""
     accounts_json = os.environ.get("ACCOUNTS_JSON", "").strip()
@@ -169,6 +234,9 @@ def load_accounts_from_env():
                         "password": str(item.get("password") or "").strip(),
                         "proxy_url": str(item.get("proxy_url") or "").strip(),
                         "otp_secret": str(item.get("otp_secret") or "").strip(),
+                        "atoken": parse_atoken(
+                            item.get("atoken") or item.get("access_token") or item.get("atoken_raw") or ""
+                        ),
                     }
                 )
         return accounts
@@ -178,30 +246,48 @@ def load_accounts_from_env():
         email = os.environ.get(f"EMAIL_{index}", "").strip()
         password = os.environ.get(f"PASSWORD_{index}", "").strip()
         proxy_url = os.environ.get(f"PROXY_URL_{index}", "").strip()
-        if any([email, password, proxy_url]):
+        otp_secret = os.environ.get(f"OTP_SECRET_{index}", "").strip()
+        atoken_raw = first_env(f"ATOKEN_{index}", f"atoken_{index}", f"ACCESS_TOKEN_{index}")
+        if any([email, password, proxy_url, otp_secret, atoken_raw]):
             accounts.append(
                 {
                     "email": email,
                     "password": password,
                     "proxy_url": proxy_url,
-                    "otp_secret": os.environ.get(f"OTP_SECRET_{index}", "").strip(),
+                    "otp_secret": otp_secret,
+                    "atoken": parse_atoken(atoken_raw),
                 }
             )
 
     if accounts:
         return accounts
 
-    if os.environ.get("EMAIL", "").strip() or os.environ.get("PASSWORD", "").strip() or os.environ.get("PROXY_URL", "").strip():
+    email = os.environ.get("EMAIL", "").strip()
+    password = os.environ.get("PASSWORD", "").strip()
+    proxy_url = os.environ.get("PROXY_URL", "").strip()
+    otp_secret = os.environ.get("OTP_SECRET", "").strip()
+    atoken_raw = first_env("ATOKEN", "atoken", "ACCESS_TOKEN")
+    if any([email, password, proxy_url, otp_secret, atoken_raw]):
         return [
             {
-                "email": os.environ.get("EMAIL", "").strip(),
-                "password": os.environ.get("PASSWORD", "").strip(),
-                "proxy_url": os.environ.get("PROXY_URL", "").strip(),
-                "otp_secret": os.environ.get("OTP_SECRET", "").strip(),
+                "email": email,
+                "password": password,
+                "proxy_url": proxy_url,
+                "otp_secret": otp_secret,
+                "atoken": parse_atoken(atoken_raw),
             }
         ]
 
     return []
+
+
+def first_env(*names):
+    """按顺序返回第一个非空环境变量值（兼容不同大小写写法）。"""
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def build_session(account, proxy_ready=False):
@@ -218,7 +304,7 @@ def build_session(account, proxy_ready=False):
 
 
 def load_session_store():
-    """从环境变量读取上次保存的登录会话：{账号序号: {cookie, user_id, username}}。"""
+    """从环境变量读取上次保存的登录会话：{账号序号: {refresh, user_id, username}}。"""
     raw = os.environ.get(SESSIONS_ENV, "").strip()
     if not raw:
         return {}
@@ -245,30 +331,75 @@ def export_session_store(store):
         print("保存会话到 GITHUB_ENV 失败:", exc)
 
 
-def save_session_cookie(session, store, account_index, user=None):
-    """登录成功后把会话 cookie 记录到 store；user 为 None 时删除该账号旧会话。"""
+def save_session(session, store, account_index, user=None):
+    """登录成功后把刷新令牌记录到 store；user 为 None 时删除该账号旧会话。"""
     if store is None:
         return
     key = str(account_index)
     if user is None:
         store.pop(key, None)
         return
-    for cookie in session.cookies:
-        if cookie.name == SESSION_COOKIE_NAME:
-            store[key] = {
-                "cookie": cookie.value,
-                "user_id": user.get("id"),
-                "username": user.get("username") or "",
+    refresh = session.cookies.get(REFRESH_COOKIE_NAME)
+    if not refresh:
+        return
+    store[key] = {
+        "refresh": refresh,
+        "user_id": user.get("id"),
+        "username": user.get("username") or "",
+    }
+
+
+def reuse_saved_session(session, saved):
+    """用保存的刷新令牌换取新的访问令牌，成功返回用户信息，失败返回 None。"""
+    if not isinstance(saved, dict):
+        return None
+
+    refresh = str(saved.get("refresh") or "").strip()
+    if refresh:
+        # 新版 new-api：POST /api/user/auth/refresh（需 Origin 校验通过）
+        session.cookies.set(REFRESH_COOKIE_NAME, refresh, domain=COOKIE_DOMAIN, path="/")
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/",
+        }
+        try:
+            resp = session.post(f"{BASE_URL}/api/user/auth/refresh", headers=headers, json={}, timeout=20)
+        except requests.RequestException as exc:
+            print(f"刷新登录会话网络异常: {exc.__class__.__name__}")
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+        if data.get("success") is not True:
+            return None
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        token = payload.get("access_token")
+        if token:
+            session.headers["Authorization"] = str(token)
+        user_data = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+        user_id = user_data.get("id") or saved.get("user_id")
+        if user_id in (None, ""):
+            return None
+        return {
+            "id": user_id,
+            "username": user_data.get("username") or saved.get("username") or str(user_id),
+        }
+
+    # 兼容更早版本保存的 session cookie
+    legacy_cookie = str(saved.get("cookie") or "").strip()
+    if legacy_cookie:
+        session.cookies.set(SESSION_COOKIE_NAME, legacy_cookie, domain=COOKIE_DOMAIN, path="/")
+        user_data, _status = fetch_self(session, saved.get("user_id"))
+        if user_data:
+            return {
+                "id": user_data.get("id"),
+                "username": user_data.get("username") or saved.get("username") or "",
             }
-            return
-
-
-def restore_session_cookie(session, saved):
-    """把保存的会话 cookie 装回 session；格式异常返回 False。"""
-    if not isinstance(saved, dict) or not saved.get("cookie") or not saved.get("user_id"):
-        return False
-    session.cookies.set(SESSION_COOKIE_NAME, saved["cookie"], domain=COOKIE_DOMAIN, path="/")
-    return True
+    return None
 
 
 def resolve_singbox_path(path):
@@ -355,12 +486,19 @@ def stop_local_proxy(process, temp_dir):
 
 
 def _extract_user_info(payload):
+    """从接口响应中解析用户信息。
+
+    兼容多种结构：data.user（新版登录/刷新响应）、data 本身、顶层。
+    """
     if not isinstance(payload, dict):
         return None
 
     candidates = []
-    if isinstance(payload.get("data"), dict):
-        candidates.append(payload["data"])
+    data = payload.get("data")
+    if isinstance(data, dict):
+        if isinstance(data.get("user"), dict):
+            candidates.append(data["user"])
+        candidates.append(data)
     candidates.append(payload)
 
     for item in candidates:
@@ -374,7 +512,7 @@ def _extract_user_info(payload):
                 break
 
         username = None
-        for key in ["username", "name", "user_name", "email", "user_email"]:
+        for key in ["username", "name", "user_name", "display_name", "email", "user_email"]:
             if item.get(key) not in (None, ""):
                 username = item.get(key)
                 break
@@ -388,125 +526,60 @@ def _extract_user_info(payload):
     return None
 
 
-def _login_pending_2fa(session: requests.Session, email, password, headers):
-    """重新执行密码登录，建立"待 2FA 验证"的服务端会话。"""
-    login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
+def _apply_login_session(session, data):
+    """登录成功后把访问令牌挂到会话上。
+
+    新版 new-api 的 /api/user/* 接口需要 `Authorization` 头（访问令牌），
+    会话 Cookie 只用于刷新令牌换取新的访问令牌。
+    """
+    if not isinstance(data, dict):
+        return
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return
+    token = payload.get("access_token")
+    if token:
+        session.headers["Authorization"] = str(token)
+
+
+def fetch_self(session, user_id_hint=None):
+    """GET /api/user/self，返回 (user_data 或 None, status)。
+
+    status: "ok" 成功；"auth" 鉴权失败；CONN_ERROR 连接异常；"error" 其他失败。
+    """
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": BASE_URL,
+    }
+    if user_id_hint not in (None, ""):
+        headers["New-Api-User"] = str(user_id_hint)
+
     try:
-        resp = session.post(login_url, headers=headers, json={"username": email, "password": password}, timeout=20)
+        resp = session.get(f"{BASE_URL}/api/user/self", headers=headers, timeout=20)
     except requests.RequestException as exc:
-        return False, {"message": f"网络异常: {exc.__class__.__name__}"}
+        print(f"获取用户信息网络异常: {exc.__class__.__name__}")
+        return None, CONN_ERROR
+
     try:
         data = resp.json()
     except ValueError:
-        data = {}
-    pending = (
-        data.get("success") is True
-        and isinstance(data.get("data"), dict)
-        and data["data"].get("require_2fa")
-    )
-    return pending, data
+        return None, "error"
+
+    if resp.status_code == 401 or str(data.get("code") or "") == "AUTH_UNAUTHORIZED":
+        return None, "auth"
+    if data.get("success") is not True:
+        return None, "error"
+
+    user_data = data.get("data")
+    if not isinstance(user_data, dict) or user_data.get("id") in (None, ""):
+        return None, "error"
+    return user_data, "ok"
 
 
-def _submit_otp_code(session: requests.Session, email, password, otp_secret, payload):
-    """提交 2FA 验证码。
-
-    站点真实流程（已抓包验证）：
-      1. POST /api/user/login {username, password} -> {"data":{"require_2fa":true},"success":true}
-         同时下发 session cookie（保存待验证状态）
-      2. POST /api/user/login/2fa {"code": "123456"} -> 成功时 data 即用户信息
-    只需要 code 一个字段，凭证由会话承载。验证码错误返回
-    {"message":"验证码或备用码不正确","success":false}，且会话在失败后仍然有效。
-
-    返回 (user 或 None, 是否因账户锁定而中止)。
-    """
-    otp_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-        "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/otp",
-    }
-    endpoint = f"{BASE_URL}/api/user/login/2fa"
-
-    base_ts = int(time.time())
-    # 依次尝试 当前/上一/下一 时间窗，容忍与服务器 30s 内的时钟偏差
-    windows = [
-        ("当前时间窗", base_ts),
-        ("上一时间窗", base_ts - 30),
-        ("下一时间窗", base_ts + 30),
-    ]
-
-    last_message = ""
-    for label, ts in windows:
-        code = generate_totp_code(otp_secret, at=ts)
-        if not code:
-            print("未能生成 2FA 验证码，请检查 OTP_SECRET")
-            return None, False
-
-        print(f"📡 提交 2FA | {label} | 验证码 {code} (可与手机验证器比对)")
-        try:
-            resp = session.post(endpoint, headers=otp_headers, json={"code": code}, timeout=20)
-        except requests.RequestException as exc:
-            last_message = f"网络异常: {exc.__class__.__name__}"
-            print(f"   ↳ {last_message}")
-            continue
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {}
-        print(f"   ↳ 响应 {resp.status_code}: {json.dumps(data, ensure_ascii=False)[:200]}")
-        last_message = str(data.get("message") or "")
-
-        if "锁定" in last_message or "稍后再试" in last_message:
-            # 站点对连续验证码错误有临时锁定机制，继续重试只会延长锁定
-            print("⚠️ 账户因多次验证码错误被临时锁定，停止重试，请稍后运行并核对 OTP_SECRET")
-            return None, True
-
-        if data.get("success") is not True:
-            # 验证码被拒（验证码或备用码不正确等），换下一个时间窗
-            continue
-
-        if isinstance(data.get("data"), dict) and data["data"].get("require_2fa"):
-            # 服务端丢失了待验证会话：重新登录建立会话后，用同一验证码重试
-            print("   ↳ 服务端仍要求 2FA（会话状态丢失），重新登录后重试")
-            pending, redata = _login_pending_2fa(session, email, password, otp_headers)
-            if not pending:
-                print("   ↳ 重新登录失败:", json.dumps(redata, ensure_ascii=False)[:200])
-                return None, False
-            try:
-                resp = session.post(endpoint, headers=otp_headers, json={"code": code}, timeout=20)
-            except requests.RequestException as exc:
-                last_message = f"网络异常: {exc.__class__.__name__}"
-                print(f"   ↳ {last_message}")
-                continue
-            try:
-                data = resp.json()
-            except ValueError:
-                data = {}
-            print(f"   ↳ 重试响应 {resp.status_code}: {json.dumps(data, ensure_ascii=False)[:200]}")
-            last_message = str(data.get("message") or "")
-            if data.get("success") is not True:
-                continue
-
-        extracted = _extract_user_info(data)
-        if extracted and extracted.get("id") not in (None, ""):
-            print(f"✅ 2FA 验证成功 | 账户: {mask_username(extracted['username'])}")
-            return extracted, False
-        print("2FA 认证成功但未能解析到用户信息，响应体如下:")
-        print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
-        return None, False
-
-    print(f"❌ 2FA 验证码全部被拒绝，最后响应：{last_message}")
-    print("   排查建议：核对 OTP_SECRET 是否为该账号两步验证的密钥")
-    print("   （若复制的是 otpauth:// 链接，请填其中的 secret 参数值），")
-    print("   并用手机验证器当前 6 位数字与上方日志中的验证码比对确认。")
-    return None, False
-
-
-def login(session: requests.Session, email, password, otp_secret="", use_proxy=False):
-    """登录并返回用户信息（id + username），若触发 2FA 则自动提交验证码。"""
+def _post_login(session, email, password, use_proxy=False):
+    """POST /api/user/login，返回 (data 或 None, status)。"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(TURNSTILE_TOKEN)}"
-
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -514,7 +587,6 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/login",
     }
-
     payload = {"username": email, "password": password}
     max_attempts = 1 if use_proxy else 3
     resp = None
@@ -546,22 +618,200 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
         return None, resp.status_code
 
     try:
+        return resp.json(), 200
+    except ValueError:
+        return {}, 200
+
+
+def _login_challenge(data):
+    """识别登录响应中的 2FA / 验证流程。
+
+    新版 new-api 返回：
+        {"data": {"require_verification": true, "flow_token": "...", "methods": [...]}}
+    旧版返回 require_2fa 标记。
+    """
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return None
+    methods = payload.get("methods") if isinstance(payload.get("methods"), list) else []
+    if payload.get("require_verification") is True:
+        return {
+            "kind": "verify",
+            "flow_token": str(payload.get("flow_token") or ""),
+            "expires_at": payload.get("expires_at"),
+            "methods": methods,
+        }
+    if payload.get("require_2fa") is True:
+        return {
+            "kind": "legacy_2fa",
+            "flow_token": str(payload.get("flow_token") or ""),
+            "expires_at": payload.get("expires_at"),
+            "methods": methods,
+        }
+    return None
+
+
+def _challenge_supports_2fa(challenge):
+    """判断验证流程是否提供可用的 2FA 方式。"""
+    methods = challenge.get("methods") or []
+    if not methods:
+        return True  # 未给出方法列表时按 2FA 处理（兼容旧版接口）
+    for item in methods:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("method") or "").lower() in ("2fa", "totp"):
+            return item.get("available") is not False
+    return False
+
+
+def _submit_login_code(session, challenge, code):
+    """提交 2FA 验证码，返回 (data, status)。
+
+    status: "ok" 成功；"failed" 验证码被拒；"locked" 账户被锁定；
+            "expired" 验证流程失效（需重新登录换取新流程）；CONN_ERROR 网络异常；"error" 其他。
+    """
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/otp",
+    }
+    flow_token = str(challenge.get("flow_token") or "").strip()
+    if flow_token:
+        endpoint = f"{BASE_URL}/api/user/login/verify"
+        body = {"flow_token": flow_token, "method": "2fa", "code": code}
+    else:
+        # 极旧版本只接受 code，凭证由会话承载
+        endpoint = f"{BASE_URL}/api/user/login/2fa"
+        body = {"code": code}
+
+    try:
+        resp = session.post(endpoint, headers=headers, json=body, timeout=20)
+    except requests.RequestException as exc:
+        print(f"   ↳ 提交验证码网络异常: {exc.__class__.__name__}")
+        return None, CONN_ERROR
+
+    try:
         data = resp.json()
     except ValueError:
         data = {}
+    print(f"   ↳ 响应 {resp.status_code}: {json.dumps(data, ensure_ascii=False)[:200]}")
 
     if data.get("success") is True:
-        if isinstance(data.get("data"), dict) and data["data"].get("require_2fa"):
-            message = str(data.get("message") or "")
+        return data, "ok"
+
+    code_field = str(data.get("code") or "")
+    message = str(data.get("message") or "")
+    lowered = message.lower()
+    if code_field == "SECURITY_VERIFICATION_LOCKED" or "锁定" in message or "locked" in lowered:
+        return data, "locked"
+    if code_field == "AUTH_FLOW_INVALID" or "expired" in lowered or "流程" in message:
+        return data, "expired"
+    if code_field in ("SECURITY_VERIFICATION_FAILED", "TWOFA_CODE_INVALID") or "验证码" in message or "验证" in message:
+        return data, "failed"
+    return data, "error"
+
+
+def _complete_login_verification(session, email, password, otp_secret, challenge, use_proxy):
+    """完成 2FA 验证；验证码被拒时自动重试（默认 2 次）。
+
+    每次重试都会重新执行密码登录，换取全新的 flow_token —— 因为验证流程 5 分钟即过期，
+    且被消费后无法复用；同时按 当前/上一/下一 时间窗依次生成验证码，容忍时钟偏差。
+    """
+    total_attempts = 1 + OTP_RETRY_TIMES
+    current = challenge
+    last_message = ""
+
+    for attempt in range(1, total_attempts + 1):
+        offset = OTP_WINDOW_OFFSETS[(attempt - 1) % len(OTP_WINDOW_OFFSETS)]
+        if offset == 0:
+            window_label = "当前时间窗"
+        elif offset < 0:
+            window_label = "上一时间窗"
+        else:
+            window_label = "下一时间窗"
+
+        code = generate_totp_code(otp_secret, at=int(time.time()) + offset)
+        if not code:
+            print("未能生成 2FA 验证码，请检查 OTP_SECRET")
+            return None, 200
+
+        print(f"📡 提交 2FA（第 {attempt}/{total_attempts} 次）| {window_label} | 验证码 {code} (可与手机验证器比对)")
+        data, status = _submit_login_code(session, current, code)
+
+        if status == "ok":
+            user = _extract_user_info(data)
+            if user and user.get("id") not in (None, ""):
+                _apply_login_session(session, data)
+                print(f"✅ 2FA 验证成功 | 账户: {mask_username(user['username'])}")
+                return user, 200
+            print("2FA 认证成功但未能解析到用户信息，响应体如下:")
+            print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+            return None, 200
+
+        if status == "locked":
+            print("⚠️ 账户因多次验证码错误被临时锁定，停止重试，请稍后运行并核对 OTP_SECRET")
+            return None, LOCKED
+
+        if status == CONN_ERROR:
+            last_message = "网络异常"
+        else:
+            last_message = str((data or {}).get("message") or "")
+
+        if attempt >= total_attempts:
+            break
+
+        print(f"🔁 2FA 未通过（{last_message or '验证码被拒'}），重新获取验证流程后重试...")
+        refreshed, refresh_status = _post_login(session, email, password, use_proxy=use_proxy)
+        if refreshed is None:
+            print("   ↳ 重新登录失败，停止重试")
+            return None, (refresh_status if refresh_status in (CONN_ERROR, 429) else 200)
+
+        new_challenge = _login_challenge(refreshed)
+        if new_challenge is None:
+            # 极端情况下重新登录直接成功
+            user = _extract_user_info(refreshed)
+            if user and user.get("id") not in (None, ""):
+                _apply_login_session(session, refreshed)
+                print(f"✅ 登录成功 | 账户: {mask_username(user['username'])}")
+                return user, 200
+            print("   ↳ 重新登录未返回验证流程，停止重试")
+            return None, 200
+        current = new_challenge
+        time.sleep(1)
+
+    print(f"❌ 2FA 验证码全部被拒绝（已重试 {OTP_RETRY_TIMES} 次），最后响应：{last_message}")
+    print("   排查建议：核对 OTP_SECRET 是否为该账号两步验证的密钥")
+    print("   （若复制的是 otpauth:// 链接，请填其中的 secret 参数值），")
+    print("   并用手机验证器当前 6 位数字与上方日志中的验证码比对确认。")
+    return None, 200
+
+
+def login(session: requests.Session, email, password, otp_secret="", use_proxy=False):
+    """登录并返回用户信息（id + username），若触发 2FA 则自动提交验证码。"""
+    data, status = _post_login(session, email, password, use_proxy=use_proxy)
+    if data is None:
+        return None, status
+
+    if data.get("success") is True:
+        challenge = _login_challenge(data)
+        if challenge is not None:
+            if not _challenge_supports_2fa(challenge):
+                print("🔐 登录需要验证，但站点未提供可用的 2FA 方式（可能已锁定或仅支持 Passkey）")
+                print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+                return None, 200
             if not otp_secret:
-                print("登录需要 2FA，但未提供 OTP_SECRET")
+                print("登录需要 2FA，但未提供 OTP_SECRET（也可改用访问令牌 ATOKEN_x 免 2FA）")
                 return None, 200
             print("🔐 检测到 2FA，正在自动提交验证码...")
-            otp_user, locked = _submit_otp_code(session, email, password, otp_secret, payload)
-            return otp_user, (LOCKED if locked else 200)
+            return _complete_login_verification(session, email, password, otp_secret, challenge, use_proxy)
 
         extracted = _extract_user_info(data)
         if extracted and extracted.get("id") not in (None, ""):
+            _apply_login_session(session, data)
             print(f"✅ 登录成功 | 账户: {mask_username(extracted['username'])}")
             return extracted, 200
         print("登录成功但未能解析到用户信息，响应体如下:")
@@ -574,37 +824,24 @@ def login(session: requests.Session, email, password, otp_secret="", use_proxy=F
         return None, LOCKED
 
     if not otp_secret:
-        print("登录失败:", data.get("message", ""))
+        print("登录失败:", message)
         return None, 200
 
-    if "2fa" not in message.lower() and "otp" not in message.lower() and "验证码" not in message:
-        print("登录失败:", data.get("message", ""))
-        return None, 200
+    lowered = message.lower()
+    if "2fa" in lowered or "otp" in lowered or "验证码" in message or "验证" in message:
+        # 少数旧版部署会直接以错误提示要求验证码，走同一套验证流程
+        print("🔐 检测到 2FA，正在自动提交验证码...")
+        challenge = {"kind": "legacy_2fa", "flow_token": "", "methods": []}
+        return _complete_login_verification(session, email, password, otp_secret, challenge, use_proxy)
 
-    print("🔐 检测到 2FA，正在自动提交验证码...")
-    otp_user, locked = _submit_otp_code(session, email, password, otp_secret, payload)
-    return otp_user, (LOCKED if locked else 200)
+    print("登录失败:", message)
+    return None, 200
 
 
 def get_user_info(session: requests.Session, user_id):
     """获取用户信息，返回 data 字典（包含 quota 等字段）。"""
-    url = f"{BASE_URL}/api/user/self"
-
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0",
-        "Referer": BASE_URL,
-        "New-Api-User": str(user_id),
-    }
-
-    resp = session.get(url, headers=headers, timeout=20)
-    try:
-        data = resp.json()
-    except ValueError:
-        return None
-    if data.get("success"):
-        return data.get("data", {})
-    return None
+    user_data, _status = fetch_self(session, user_id)
+    return user_data
 
 
 def checkin(session: requests.Session, user_id):
@@ -736,6 +973,8 @@ def do_checkin(session, user):
             "balance_after": balance_after,
             "awarded": 0,
         }
+    if "turnstile" in msg.lower():
+        print("⚠️ 站点对签到开启了 Turnstile 人机验证，脚本无法自动通过，请在站点后台关闭或改用访问令牌")
     log_summary = f"❌ 签到失败 | 账户: {masked_username} | {msg}"
     print("\n" + "=" * 25)
     print(log_summary)
@@ -750,11 +989,48 @@ def do_checkin(session, user):
     }
 
 
+def run_token_checkin(session, account):
+    """使用系统访问令牌（ATOKEN_x）直接完成签到，返回 (result 或 None, status)。
+
+    令牌模式无需账号密码、无需 2FA：把令牌放进 `Authorization` 头，
+    服务端据此识别用户；配置里的用户 ID / 用户名仅作为兜底与展示。
+    """
+    token_info = account.get("atoken") or {}
+    token = token_info.get("token") or ""
+    if not token:
+        return None, TOKEN_INVALID
+
+    session.headers["Authorization"] = token
+
+    user_data, status = fetch_self(session)
+    if status == "auth" and token_info.get("id"):
+        # 兼容仍要求 New-Api-User 的旧版部署
+        user_data, status = fetch_self(session, token_info["id"])
+
+    if user_data is None:
+        if status == "auth":
+            print("❌ 访问令牌无效或已失效，请到站点「个人设置 → 系统访问令牌」重新生成")
+            return None, TOKEN_INVALID
+        if status == CONN_ERROR:
+            return None, CONN_ERROR
+        print("❌ 访问令牌可用但获取用户信息失败")
+        return None, "failed"
+
+    user_id = user_data.get("id")
+    username = user_data.get("username") or token_info.get("name") or str(user_id)
+    print(f"🔑 访问令牌登录成功 | 账户: {mask_username(username)} (ID {user_id})")
+    return do_checkin(session, {"id": user_id, "username": username}), "ok"
+
+
 def run_account(account, account_index, total_accounts, saved_session=None, session_store=None):
     email = account.get("email", "")
     password = account.get("password", "")
-    if not email or not password:
-        print(f"⚠️ 账号 {account_index}/{total_accounts} 缺少邮箱或密码，跳过")
+    atoken = account.get("atoken") or {}
+    has_token = bool(atoken.get("token"))
+    has_password = bool(email and password)
+
+    if not has_token and not has_password:
+        print(f"⚠️ 账号 {account_index}/{total_accounts} 缺少访问令牌或邮箱密码，跳过")
         return None
 
     proxy_state = {"process": None, "temp_dir": None}
@@ -766,7 +1042,7 @@ def run_account(account, account_index, total_accounts, saved_session=None, sess
         proxy_state["temp_dir"] = None
 
     def attempt(reuse_session):
-        """执行一轮 起代理→(复用会话/登录)→签到，返回 (result 或 None, status)。"""
+        """执行一轮 起代理→(令牌/复用会话/登录)→签到，返回 (result 或 None, status)。"""
         try:
             proxy_state["process"], proxy_state["temp_dir"] = start_local_proxy(
                 account, account_index, total_accounts
@@ -781,22 +1057,37 @@ def run_account(account, account_index, total_accounts, saved_session=None, sess
                 else:
                     print("⚠️ 无法通过代理获取出口IP，代理节点可能不可用或已失效")
 
+            # 1) 优先使用访问令牌：免登录、免 2FA，最稳定
+            if has_token:
+                result, status = run_token_checkin(session, account)
+                if result is not None:
+                    return result, "ok"
+                if not has_password:
+                    return None, status
+                print("⚠️ 访问令牌不可用，改用账号密码登录完成签到")
+
             otp_secret = account.get("otp_secret") or os.environ.get("OTP_SECRET", "")
             user = None
 
-            # 1) 优先复用上次保存的登录会话，避免每次登录和 2FA
-            if reuse_session and restore_session_cookie(session, saved_session):
-                probe_id = saved_session.get("user_id")
-                user = {"id": probe_id, "username": saved_session.get("username") or ""}
-                info = get_user_info(session, probe_id)
-                if info:
-                    print(f"♻️ 复用已保存登录会话，跳过登录与 2FA | 账户: {mask_username(info.get('username') or user['username'])}")
+            # 2) 复用上次保存的登录会话，避免每次登录和 2FA
+            if reuse_session and saved_session:
+                reused = reuse_saved_session(session, saved_session)
+                if reused:
+                    info, _status = fetch_self(session, reused.get("id"))
+                    if info:
+                        user = {
+                            "id": info.get("id"),
+                            "username": info.get("username") or reused.get("username") or "",
+                        }
+                        print(f"♻️ 复用已保存登录会话，跳过登录与 2FA | 账户: {mask_username(user['username'])}")
+                    else:
+                        print("已保存会话已失效，转入正常登录")
+                        save_session(None, session_store, account_index)
                 else:
                     print("已保存会话已失效，转入正常登录")
-                    user = None
-                    save_session_cookie(None, session_store, account_index)
+                    save_session(None, session_store, account_index)
 
-            # 2) 完整登录（可能触发 2FA）
+            # 3) 完整登录（可能触发 2FA）
             if user is None:
                 user, login_status = login(session, email, password, otp_secret, use_proxy=proxy_ready)
                 if not user and login_status in (429, CONN_ERROR) and proxy_ready:
@@ -805,11 +1096,11 @@ def run_account(account, account_index, total_accounts, saved_session=None, sess
                     session = build_session(account, proxy_ready=False)
                     user, login_status = login(session, email, password, otp_secret, use_proxy=False)
                 if not user:
-                    save_session_cookie(None, session_store, account_index)
+                    save_session(None, session_store, account_index)
                     return None, (login_status if login_status in (LOCKED, CONN_ERROR) else "failed")
 
             # 登录成功，记录当前会话供下次复用
-            save_session_cookie(session, session_store, account_index, user)
+            save_session(session, session_store, account_index, user)
             return do_checkin(session, user), "ok"
         finally:
             cleanup_proxy()
@@ -817,7 +1108,7 @@ def run_account(account, account_index, total_accounts, saved_session=None, sess
     try:
         result, status = attempt(reuse_session=True)
 
-        # 3) 2FA 锁定：保持本次运行等待 16 分钟后再尝试一次
+        # 4) 2FA 锁定：保持本次运行等待 16 分钟后再尝试一次
         if status == LOCKED:
             wait_minutes = 16
             until = time.strftime("%H:%M:%S", time.gmtime(time.time() + wait_minutes * 60 + 8 * 3600))
@@ -833,12 +1124,14 @@ def run_account(account, account_index, total_accounts, saved_session=None, sess
             detail = "登录失败: 代理与直连均无法连接"
         elif status == LOCKED:
             detail = "登录失败: 2FA 锁定，重试仍未成功（请核对 OTP_SECRET）"
+        elif status == TOKEN_INVALID:
+            detail = "登录失败: 访问令牌无效，请重新生成 ATOKEN_x"
         elif status == 429:
             detail = "登录失败: 请求被限流(429)"
         else:
             detail = "登录失败: 凭据或 2FA 验证问题"
         print(f"\n{detail}，无法继续签到")
-        return _fail(mask_username(email or "未知账号"), detail)
+        return _fail(mask_username(email or (atoken.get("name") or "未知账号")), detail)
     finally:
         cleanup_proxy()
 
@@ -846,10 +1139,13 @@ def run_account(account, account_index, total_accounts, saved_session=None, sess
 def main():
     accounts = load_accounts_from_env()
     if not accounts:
-        print("请先配置账号环境变量，例如 EMAIL_1 / PASSWORD_1 / PROXY_URL_1")
+        print("请先配置账号环境变量，例如 ATOKEN_1（推荐）或 EMAIL_1 / PASSWORD_1 / OTP_SECRET_1")
         sys.exit(1)
 
     print(f"共发现 {len(accounts)} 个账号配置")
+    token_count = sum(1 for item in accounts if (item.get("atoken") or {}).get("token"))
+    if token_count:
+        print(f"🔑 其中 {token_count} 个账号配置了访问令牌（ATOKEN_x），将优先使用令牌签到")
     direct_ip = fetch_exit_ip()
     if direct_ip:
         print(f"🏠 本机直连出口IP: {mask_ip(direct_ip)} （对照用：若与代理出口IP相同说明代理未生效）")
