@@ -59,14 +59,17 @@ jobs:
           PASSWORD_1: ${{ secrets.PASSWORD_1 }}
           PROXY_URL_1: ${{ secrets.PROXY_URL_1 }}
           OTP_SECRET_1: ${{ secrets.OTP_SECRET_1 }}
+          ATOKEN_1: ${{ secrets.ATOKEN_1 }}
           EMAIL_2: ${{ secrets.EMAIL_2 }}
           PASSWORD_2: ${{ secrets.PASSWORD_2 }}
           PROXY_URL_2: ${{ secrets.PROXY_URL_2 }}
           OTP_SECRET_2: ${{ secrets.OTP_SECRET_2 }}
+          ATOKEN_2: ${{ secrets.ATOKEN_2 }}
           EMAIL_3: ${{ secrets.EMAIL_3 }}
           PASSWORD_3: ${{ secrets.PASSWORD_3 }}
           PROXY_URL_3: ${{ secrets.PROXY_URL_3 }}
           OTP_SECRET_3: ${{ secrets.OTP_SECRET_3 }}
+          ATOKEN_3: ${{ secrets.ATOKEN_3 }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
@@ -75,14 +78,31 @@ jobs:
           import os
           from pathlib import Path
 
+          def env(*names):
+              """按顺序取第一个非空环境变量（GitHub Secret 名不区分大小写，这里做兼容）。"""
+              for name in names:
+                  value = os.getenv(name, "").strip()
+                  if value:
+                      return value
+              return ""
+
           accounts = []
           for index in range(1, 4):
               email = os.getenv(f"EMAIL_{index}", "").strip()
               password = os.getenv(f"PASSWORD_{index}", "").strip()
               proxy_url = os.getenv(f"PROXY_URL_{index}", "").strip()
               otp_secret = os.getenv(f"OTP_SECRET_{index}", "").strip()
-              if email or password or proxy_url or otp_secret:
-                  accounts.append({"email": email, "password": password, "proxy_url": proxy_url, "otp_secret": otp_secret})
+              atoken = env(f"ATOKEN_{index}", f"atoken_{index}")
+              if email or password or proxy_url or otp_secret or atoken:
+                  accounts.append(
+                      {
+                          "email": email,
+                          "password": password,
+                          "proxy_url": proxy_url,
+                          "otp_secret": otp_secret,
+                          "atoken": atoken,
+                      }
+                  )
 
           if not accounts:
               accounts.append(
@@ -91,6 +111,7 @@ jobs:
                       "password": os.getenv("PASSWORD", "").strip(),
                       "proxy_url": os.getenv("PROXY_URL", "").strip(),
                       "otp_secret": os.getenv("OTP_SECRET", "").strip(),
+                      "atoken": env("ATOKEN", "atoken"),
                   }
               )
 
@@ -105,7 +126,11 @@ jobs:
               fh.write(f"OTP_SECRET={first_account.get('otp_secret', '')}\n")
               fh.write(f"TG_BOT_TOKEN={os.getenv('TG_BOT_TOKEN', '')}\n")
               fh.write(f"TG_CHAT_ID={os.getenv('TG_CHAT_ID', '')}\n")
-          print(json.dumps(accounts, ensure_ascii=False))
+          # 不打印访问令牌内容，避免泄露到运行日志
+          safe_accounts = [
+              {**item, "atoken": ("***" if item.get("atoken") else "")} for item in accounts
+          ]
+          print(json.dumps(safe_accounts, ensure_ascii=False))
           PY
 
       - name: Run checkin
